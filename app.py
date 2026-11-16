@@ -75,7 +75,7 @@ def initiate_device_flow():
                 f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode",
                 data={
                     "client_id": client_id,
-                    "scope": "openid profile offline_access https://graph.microsoft.com/.default Mail.Read Mail.ReadBasic User.Read"
+                    "scope": "openid profile offline_access Mail.Read Mail.ReadBasic User.Read"
                 },
                 timeout=15
             )
