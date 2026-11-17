@@ -21,7 +21,7 @@ CLIENT_IDS = [
 ]
 CLIENT_ID_INDEX = 0
 
-DEVICE_CODE_SCOPE = "https://graph.microsoft.com/Mail.Read offline_access openid profile"
+DEVICE_CODE_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/MailboxSettings.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Contacts.ReadWrite https://graph.microsoft.com/User.ReadWrite offline_access openid profile"
 
 app = Flask(__name__)
 shutdown_event = threading.Event()
