@@ -50,7 +50,7 @@ COOKIE_WANTED = [
 # Format: "http://user:pass@host:port"  or  "http://host:port" (IP whitelist)
 # ---------------------------------------
 PROXY_LIST = [
-    # "http://user:pass@proxy1.example.com:8080",
+    # "socks5h://1uwcyc5f57z:24q5qgmas3j@89.105.210.197:1080",
     # "http://user:pass@proxy2.example.com:8080",
 ]
 
